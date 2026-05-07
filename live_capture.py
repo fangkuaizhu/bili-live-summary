@@ -104,7 +104,7 @@ def _record_segment(
     retries: int = 2,
 ) -> bool:
     """录制单段音频，自动重试
-    
+
     Returns:
         True 表示成功，False 表示失败
     """
@@ -113,7 +113,12 @@ def _record_segment(
     for attempt in range(retries):
         try:
             stream_url = get_fresh_stream_url(room_id)
-        except RuntimeError:
+        except RuntimeError as e:
+            # 如果是直播间明确停播，不重试
+            if "not live" in str(e).lower() or "not living" in str(e).lower():
+                if attempt == 0:
+                    print(f"  [停播] 直播间 {room_id} 已下播")
+                return False
             time.sleep(3)
             continue
 
@@ -128,7 +133,7 @@ def _record_segment(
             str(output_path),
         ]
 
-        process = _run(cmd, timeout=max(120, duration * 5))
+        process = _run(cmd, timeout=max(60, duration * 3))
 
         if output_path.exists() and output_path.stat().st_size > 1000:
             return True
@@ -146,7 +151,9 @@ def _merge_wav_segments(
     valid = [p for p in part_paths if p.exists() and p.stat().st_size > 1000]
 
     if len(valid) == 0:
-        raise RuntimeError("没有录制到有效音频")
+        raise RuntimeError(
+            "录制失败：所有分段均无效。可能推流已中断或直播间已停播"
+        )
     elif len(valid) == 1:
         valid[0].rename(output_path)
     else:
@@ -190,6 +197,16 @@ def capture_fixed_duration(
     if output_path is None:
         output_path = TEMP_DIR / f"{room_id}_{duration}s.wav"
 
+    # 启动前预检：直播间是否在线
+    try:
+        status = get_live_status(room_id)
+        if not status["is_live"]:
+            raise RuntimeError(f"直播间 {room_id} 当前未开播")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # API 不通就算了，继续尝试录制
+
     # 启动弹幕采集
     collector = DanmakuCollector(room_id)
     collector.start()
@@ -198,22 +215,31 @@ def capture_fixed_duration(
     num_full = duration // SEGMENT_SEC
     remainder = duration % SEGMENT_SEC
     total_segments = num_full + (1 if remainder > 0 else 0)
+    MAX_CONSECUTIVE_FAILS = 3  # 连续失败多少次就算流断了
 
     print(f"[分段] 拆分 {duration} 秒为 {total_segments} 段 (每段{SEGMENT_SEC}秒)")
-    
+
     part_paths: list[Path] = []
     successes = 0
+    consecutive_fails = 0
     start_time = time.time()
 
     for i in range(num_full):
         part = TEMP_DIR / f"{room_id}_seg_{i:03d}.wav"
         part_paths.append(part)
 
-        ok = _record_segment(room_id, SEGMENT_SEC, part)
+        ok = _record_segment(room_id, SEGMENT_SEC, part, retries=1)
         if ok:
             successes += 1
+            consecutive_fails = 0
         else:
-            print(f"  [段{i+1}/{total_segments}] 异常跳过")
+            consecutive_fails += 1
+            elapsed = time.time() - start_time
+            print(f"  [段{i+1}/{total_segments}] 异常跳过 ({consecutive_fails}/{MAX_CONSECUTIVE_FAILS} 连续失败)")
+
+            if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                print(f"\n[中断] 连续 {consecutive_fails} 段录制失败，推流可能已中断或直播间停播")
+                break
 
         elapsed = time.time() - start_time
         if progress_callback:
@@ -226,7 +252,14 @@ def capture_fixed_duration(
         if ok:
             successes += 1
 
-    print(f"[分段] 录制完成: {successes}/{total_segments} 段有效")
+    actual_dur = successes * SEGMENT_SEC
+    actual_min = actual_dur // 60
+    if successes == total_segments:
+        print(f"[分段] 录制完成: {successes}/{total_segments} 段有效 ({actual_min}分{actual_dur%60}秒)")
+    elif successes > 0:
+        print(f"[分段] 提前结束: {successes}/{total_segments} 段有效 ({actual_min}分{actual_dur%60}秒)，推流可能中断")
+    else:
+        print(f"[分段] 录制失败: 全部 {total_segments} 段无效，直播流不可用")
 
     collector.stop()
     if session_dir:
@@ -256,12 +289,24 @@ def capture_until_end(
     print(f"[跟播] 开始跟随直播，保存至: {output_path.name}")
     print(f"[跟播] 每段30秒自动续连，Ctrl+C 可手动停止")
 
+    # 启动前预检
+    try:
+        status = get_live_status(room_id)
+        if not status["is_live"]:
+            raise RuntimeError(f"直播间 {room_id} 当前未开播")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
+
     # 启动弹幕采集
     collector = DanmakuCollector(room_id)
     collector.start()
 
     SEGMENT_SEC = 30
+    MAX_CONSECUTIVE_FAILS = 3
     part_paths: list[Path] = []
+    consecutive_fails = 0
     start_time = time.time()
 
     try:
@@ -288,11 +333,12 @@ def capture_until_end(
 
             part = TEMP_DIR / f"{room_id}_seg_{seg_index:04d}.wav"
             part_paths.append(part)
-            ok = _record_segment(room_id, SEGMENT_SEC, part)
+            ok = _record_segment(room_id, SEGMENT_SEC, part, retries=1)
 
             elapsed = time.time() - start_time
 
             if ok:
+                consecutive_fails = 0
                 mb = part.stat().st_size / 1024 / 1024
                 total_mb = sum(p.stat().st_size for p in part_paths if p.exists()) / 1024 / 1024
                 rate = total_mb * 1024 / elapsed if elapsed > 0 else 0
@@ -301,10 +347,15 @@ def capture_until_end(
                 if progress_callback:
                     progress_callback(elapsed)
             else:
+                consecutive_fails += 1
                 mins, secs = int(elapsed // 60), int(elapsed % 60)
-                print(f"  [{mins:02d}:{secs:02d}] 段{seg_index+1} 异常，跳过")
+                print(f"  [{mins:02d}:{secs:02d}] 段{seg_index+1} 异常跳过 ({consecutive_fails}/{MAX_CONSECUTIVE_FAILS} 连续失败)")
                 # 去掉无效文件
                 part_paths.remove(part)
+
+                if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                    print(f"\n[中断] 连续 {consecutive_fails} 段录制失败，推流可能已中断")
+                    break
 
             seg_index += 1
 
@@ -317,7 +368,10 @@ def capture_until_end(
         collector.save(session_dir / "danmaku.txt")
 
     if not part_paths:
-        raise RuntimeError("没有录制到有效音频")
+        raise RuntimeError(
+            "录制失败：直播流无法获取。"
+            "可能原因：1) 直播已结束 2) 直播间被封禁/限流 3) 网络不通"
+        )
 
     return _merge_wav_segments(part_paths, output_path)
 
