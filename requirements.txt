@@ -1,0 +1,4 @@
+# Bilibili 直播助手依赖
+faster-whisper>=1.0.0       # ASR 转写
+yt-dlp>=2025.0.0            # Bilibili 直播流获取
+imageio-ffmpeg>=0.5.0       # 内置 ffmpeg 二进制
