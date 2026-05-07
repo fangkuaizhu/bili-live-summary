@@ -1,6 +1,14 @@
 ---
 name: bili-live-summary
 description: Bilibili直播/视频内容采集、转写与AI总结。输入直播间链接自动录制音频→Whisper转写→AI总结简报。支持视频链接（B站/YouTube等）和本地音频文件。弹幕采集、多平台总结API、GPU加速。
+version: 1.2.0
+source: https://github.com/fangkuaizhu/bili-live-summary
+install: |
+  git clone https://github.com/fangkuaizhu/bili-live-summary.git
+  cd bili-live-summary
+  pip install -r requirements.txt
+  cp config.example.json config.local.json
+  # 编辑 config.local.json 填入 API key
 ---
 
 # BiliLive 直播/视频 总结助手
@@ -21,11 +29,12 @@ description: Bilibili直播/视频内容采集、转写与AI总结。输入直�
 ## Quick Start
 
 ```bash
-cd H:\菲伦的文件夹\bili-live-summary
+# 进入项目目录（技能安装后自动定位）
+cd {skill_dir}
 
 # 配置 API Key（首次使用）
 cp config.example.json config.local.json
-# 编辑 config.local.json 填入你的 API Key
+# 编辑 config.local.json 填入 API Key
 
 # 快速查看直播间（5分钟）
 python main.py --url https://live.bilibili.com/xxx --check
