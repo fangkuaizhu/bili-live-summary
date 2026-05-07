@@ -103,27 +103,41 @@ def _record_segment(
     output_path: Path,
     retries: int = 2,
 ) -> bool:
-    """录制单段音频，自动重试
+    """录制单段音频
 
-    Returns:
-        True 表示成功，False 表示失败
+    重试策略（应对网络波动）:
+      第0次: 立即尝试
+      第1次: 等 2s，刷流地址（瞬断）
+      第2次: 等 5s，刷流地址（波动）
+      超时: max(30, duration*2) → 30s段=60s超时
+
+    停播检测: B站API直接返回not_live → 不重试，立即返回False
     """
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    backoff = [0, 2, 5]
 
     for attempt in range(retries):
+        # 退避等待（首次不等待）
+        if attempt > 0:
+            delay = backoff[min(attempt, len(backoff) - 1)]
+            print(f"    重试 {attempt}/{retries-1}，{delay}s 后刷新流地址...")
+            time.sleep(delay)
+
+        # 获取流地址
         try:
             stream_url = get_fresh_stream_url(room_id)
         except RuntimeError as e:
-            # 如果是直播间明确停播，不重试
             if "not live" in str(e).lower() or "not living" in str(e).lower():
                 if attempt == 0:
                     print(f"  [停播] 直播间 {room_id} 已下播")
                 return False
-            time.sleep(3)
+            # API 错误（网络问题/限流），等退避后重试
             continue
 
+        # ffmpeg 录制（加连接超时：15s 无数据则断开）
         cmd = [
             ffmpeg_exe, "-y",
+            "-rw_timeout", "15000000",     # 15s 无数据即断（微秒）
             "-t", str(duration),
             "-i", stream_url,
             "-vn",
@@ -133,12 +147,13 @@ def _record_segment(
             str(output_path),
         ]
 
-        process = _run(cmd, timeout=max(60, duration * 3))
+        process = _run(cmd, timeout=max(30, duration * 2))  # 30s段=60s
 
         if output_path.exists() and output_path.stat().st_size > 1000:
             return True
 
-        time.sleep(3)
+        # ffmpeg 失败（超时/连接断开）→ 清理无效文件，等退避后重试
+        output_path.unlink(missing_ok=True)
 
     return False
 
@@ -215,7 +230,7 @@ def capture_fixed_duration(
     num_full = duration // SEGMENT_SEC
     remainder = duration % SEGMENT_SEC
     total_segments = num_full + (1 if remainder > 0 else 0)
-    MAX_CONSECUTIVE_FAILS = 3  # 连续失败多少次就算流断了
+    MAX_CONSECUTIVE_FAILS = 2  # 连续失败多少次就算流断了
 
     print(f"[分段] 拆分 {duration} 秒为 {total_segments} 段 (每段{SEGMENT_SEC}秒)")
 
@@ -228,7 +243,7 @@ def capture_fixed_duration(
         part = TEMP_DIR / f"{room_id}_seg_{i:03d}.wav"
         part_paths.append(part)
 
-        ok = _record_segment(room_id, SEGMENT_SEC, part, retries=1)
+        ok = _record_segment(room_id, SEGMENT_SEC, part)
         if ok:
             successes += 1
             consecutive_fails = 0
@@ -245,7 +260,7 @@ def capture_fixed_duration(
         if progress_callback:
             progress_callback(elapsed)
 
-    if remainder > 0:
+    if remainder > 0 and consecutive_fails < MAX_CONSECUTIVE_FAILS:
         part = TEMP_DIR / f"{room_id}_seg_last.wav"
         part_paths.append(part)
         ok = _record_segment(room_id, remainder, part)
@@ -304,7 +319,7 @@ def capture_until_end(
     collector.start()
 
     SEGMENT_SEC = 30
-    MAX_CONSECUTIVE_FAILS = 3
+    MAX_CONSECUTIVE_FAILS = 2
     part_paths: list[Path] = []
     consecutive_fails = 0
     start_time = time.time()
@@ -333,7 +348,7 @@ def capture_until_end(
 
             part = TEMP_DIR / f"{room_id}_seg_{seg_index:04d}.wav"
             part_paths.append(part)
-            ok = _record_segment(room_id, SEGMENT_SEC, part, retries=1)
+            ok = _record_segment(room_id, SEGMENT_SEC, part)
 
             elapsed = time.time() - start_time
 
