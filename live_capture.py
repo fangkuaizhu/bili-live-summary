@@ -127,7 +127,8 @@ def _record_segment(
         try:
             stream_url = get_fresh_stream_url(room_id)
         except RuntimeError as e:
-            if "not live" in str(e).lower() or "not living" in str(e).lower():
+            err = str(e)
+            if any(kw in err for kw in ("下播", "未获取到", "not live", "not living")):
                 if attempt == 0:
                     print(f"  [停播] 直播间 {room_id} 已下播")
                 return False
