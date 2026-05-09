@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-import imageio_ffmpeg
+# imageio_ffmpeg 仅流式转写模式使用（已替换为 av）
 
 
 def _setup_cuda_paths():
@@ -65,17 +65,28 @@ def get_model() -> WhisperModel:
 # ==============================
 
 def _extract_sample(audio_path: Path, duration: int = 30) -> Path:
-    """截取音频前 N 秒作为校准样本"""
+    """截取音频前 N 秒作为校准样本（纯 Python wave）"""
+    import wave
     sample_path = TEMP_DIR / "calibrate_sample.wav"
     if not audio_path.exists() or audio_path.stat().st_size < 10000:
         return audio_path
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    subprocess.run(
-        [ffmpeg, "-y", "-t", str(duration), "-i", str(audio_path),
-         "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", str(sample_path)],
-        capture_output=True, timeout=duration + 10,
-    )
-    return sample_path if sample_path.exists() and sample_path.stat().st_size > 1000 else audio_path
+
+    try:
+        with wave.open(str(audio_path), "rb") as src:
+            rate = src.getframerate()
+            params = (src.getnchannels(), src.getsampwidth(), rate, 0, "NONE", "not compressed")
+            data = src.readframes(rate * duration)
+
+        with wave.open(str(sample_path), "wb") as dst:
+            dst.setparams(params)
+            dst.writeframes(data)
+
+        if sample_path.stat().st_size > 1000:
+            return sample_path
+    except Exception:
+        pass
+
+    return audio_path
 
 
 def _evaluate_quality(
@@ -278,7 +289,7 @@ def transcribe_video_streaming(
     import numpy as np
     config = get_scene_config(scene)
     model = get_model()
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    import imageio_ffmpeg; ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     print("[流式]  启动 yt-dlp -> ffmpeg -> Whisper 流水线...")
     yt_proc = subprocess.Popen(
         [sys.executable, "-m", "yt_dlp", "-f", "bestaudio", "-o", "-", video_url],
@@ -345,7 +356,7 @@ def transcribe_live_streaming(
     from live_capture import get_fresh_stream_url
     config = get_scene_config(scene)
     model = get_model()
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    import imageio_ffmpeg; ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     
     stream_url = get_fresh_stream_url(room_id)
     print("[流式]  启动 ffmpeg -> Whisper 流水线...")

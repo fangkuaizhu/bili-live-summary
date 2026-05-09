@@ -12,24 +12,24 @@
 3. 截图：从直播流取一帧存为 jpg
 """
 
-import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Optional, Callable
 
-import imageio_ffmpeg
-
 from config import TEMP_DIR, OUTPUT_DIR
 from danmaku import DanmakuCollector
+from audio_utils import merge_wav_segments
 
 
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    """安全执行子进程，避免 GBK 编码崩溃"""
+    """安全执行子进程，避免 GBK 编码崩溃
+    
+    默认不捕获输出（避免管道死锁）。需要输出时传 capture_output=True。
+    """
     kwargs.setdefault("timeout", 300)
-    kwargs.setdefault("capture_output", True)
-    kwargs["text"] = False  # 用 bytes 模式避免自动 GBK 解码
+    kwargs["text"] = False  # bytes 模式避免自动 GBK 解码
     try:
         result = subprocess.run(cmd, **kwargs)
     except subprocess.TimeoutExpired as e:
@@ -54,7 +54,7 @@ def get_live_status(room_id: str) -> dict:
     result = _run(
         [sys.executable, "-m", "yt_dlp", "--dump-json",
          f"https://live.bilibili.com/{room_id}"],
-        timeout=30,
+        capture_output=True, timeout=30,
     )
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
@@ -103,27 +103,17 @@ def _record_segment(
     output_path: Path,
     retries: int = 2,
 ) -> bool:
-    """录制单段音频
+    """录制单段音频（requests 下载 + av 转码）"""
+    from audio_utils import transcode_to_wav
 
-    重试策略（应对网络波动）:
-      第0次: 立即尝试
-      第1次: 等 2s，刷流地址（瞬断）
-      第2次: 等 5s，刷流地址（波动）
-      超时: max(30, duration*2) → 30s段=60s超时
-
-    停播检测: B站API直接返回not_live → 不重试，立即返回False
-    """
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     backoff = [0, 2, 5]
 
     for attempt in range(retries):
-        # 退避等待（首次不等待）
         if attempt > 0:
             delay = backoff[min(attempt, len(backoff) - 1)]
             print(f"    重试 {attempt}/{retries-1}，{delay}s 后刷新流地址...")
             time.sleep(delay)
 
-        # 获取流地址
         try:
             stream_url = get_fresh_stream_url(room_id)
         except RuntimeError as e:
@@ -132,70 +122,40 @@ def _record_segment(
                 if attempt == 0:
                     print(f"  [停播] 直播间 {room_id} 已下播")
                 return False
-            # API 错误（网络问题/限流），等退避后重试
             continue
 
-        # ffmpeg 录制（加连接超时：15s 无数据则断开）
-        cmd = [
-            ffmpeg_exe, "-y",
-            "-rw_timeout", "15000000",     # 15s 无数据即断（微秒）
-            "-t", str(duration),
-            "-i", stream_url,
-            "-vn",
-            "-acodec", "pcm_s16le",
-            "-ar", "16000",
-            "-ac", "1",
-            str(output_path),
-        ]
-
-        process = _run(cmd, timeout=max(30, duration * 2))  # 30s段=60s
-
-        if output_path.exists() and output_path.stat().st_size > 1000:
-            return True
-
-        # ffmpeg 失败（超时/连接断开）→ 清理无效文件，等退避后重试
-        output_path.unlink(missing_ok=True)
+        # 流式下载 + 转码
+        temp = TEMP_DIR / f"_seg_{room_id}_{int(time.time())}.flv"
+        try:
+            import requests
+            r = requests.get(stream_url,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://live.bilibili.com"},
+                stream=True, timeout=max(30, duration + 15))
+            r.raise_for_status()
+            with open(temp, "wb") as f:
+                deadline = time.time() + duration + 15
+                for chunk in r.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    if time.time() > deadline:
+                        break
+            if temp.stat().st_size > 1000:
+                transcode_to_wav(temp, output_path)
+                if output_path.exists() and output_path.stat().st_size > 1000:
+                    return True
+            output_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        finally:
+            temp.unlink(missing_ok=True)
 
     return False
 
 
-def _merge_wav_segments(
-    part_paths: list[Path],
-    output_path: Path,
-) -> Path:
-    """合并多个 WAV 分段为单个文件"""
-    valid = [p for p in part_paths if p.exists() and p.stat().st_size > 1000]
-
-    if len(valid) == 0:
-        raise RuntimeError(
-            "录制失败：所有分段均无效。可能推流已中断或直播间已停播"
-        )
-    elif len(valid) == 1:
-        valid[0].rename(output_path)
-    else:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        concat_file = TEMP_DIR / "concat_list.txt"
-
-        # ffmpeg concat demuxer 需要文件路径
-        lines = [f"file '{p.resolve().as_posix()}'" for p in valid]
-        concat_file.write_text("\n".join(lines), encoding="utf-8")
-
-        cmd = [
-            ffmpeg_exe, "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(concat_file),
-            "-c", "copy",
-            str(output_path),
-        ]
-        _run(cmd, timeout=120)
-        concat_file.unlink(missing_ok=True)
-
-    # 清理分段
-    for p in part_paths:
-        p.unlink(missing_ok=True)
-
-    return output_path
+def _merge_wav_segments(part_paths: list[Path], output_path: Path) -> Path:
+    """合并 WAV 分段（委派给 audio_utils）"""
+    return merge_wav_segments(part_paths, output_path)
 
 
 # ==============================
@@ -396,35 +356,23 @@ def capture_until_end(
 #   截图功能
 # ==============================
 
-def capture_screenshot(
-    room_id: str,
-    output_path: Optional[Path] = None,
-) -> Path:
-    """从直播流截取一帧画面
-    
-    跳过前5秒避免黑场，720p 分辨率。
-    """
+def capture_screenshot(room_id: str, output_path: Optional[Path] = None) -> Path:
+    """从直播流截取一帧画面（av 实现）"""
+    import av
     if output_path is None:
         output_path = TEMP_DIR / f"{room_id}_frame.jpg"
 
     stream_url = get_fresh_stream_url(room_id)
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-
-    cmd = [
-        ffmpeg_exe, "-y",
-        "-ss", "5",            # 跳过前5秒，避开加载黑场
-        "-i", stream_url,
-        "-vframes", "1",
-        "-q:v", "1",           # JPEG 质量最高
-        "-s", "1280x720",
-        str(output_path),
-    ]
-
-    process = _run(cmd, timeout=30)
-
-    if not output_path.exists() or output_path.stat().st_size == 0:
-        err = process.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"截图失败:\n{err}")
+    try:
+        container = av.open(stream_url, options={"timeout": "15000000"})
+        video = container.streams.video[0]
+        for frame in container.decode(video):
+            img = frame.to_image()
+            img.save(str(output_path), "JPEG", quality=90)
+            break
+        container.close()
+    except Exception as e:
+        raise RuntimeError(f"截图失败: {e}")
 
     return output_path
 
@@ -458,22 +406,19 @@ def download_video_audio(
     print(f"[视频]   正在下载音频...")
     start = time.time()
 
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-
-    # 只下载音频流（不下视频），体积小 10x+，速度显著提升
+    # yt-dlp 自行查找 ffmpeg（不再依赖 imageio_ffmpeg）
     cmd = [
         sys.executable, "-m", "yt_dlp",
-        "-f", "bestaudio",              # 仅音频流
+        "-f", "bestaudio",
         "--audio-format", "wav",
-        "--audio-quality", "5",          # 128k 足够 Whisper 识别
-        "--ffmpeg-location", ffmpeg_path,
+        "--audio-quality", "5",
         "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
         "--no-playlist",
         "-o", str(output_path),
         url,
     ]
 
-    process = _run(cmd, timeout=3600)
+    process = _run(cmd, capture_output=True, timeout=3600)
 
     if process.returncode != 0:
         err = process.stderr.decode("utf-8", errors="replace").strip()[:300]

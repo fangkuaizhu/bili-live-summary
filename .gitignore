@@ -12,3 +12,4 @@ config.local.json
 # GitHub Token
 .env
 queue/
+daemon.log

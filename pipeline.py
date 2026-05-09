@@ -86,48 +86,93 @@ def process_video(
     scene: str = "general",
     no_summarize: bool = False,
 ) -> Path:
-    """视频链接：下载 → 转写 → 总结，返回 session_dir"""
+    """视频链接：下载 → 转写 → 总结，返回 session_dir
+    
+    B站视频使用原生 API，其他平台走 yt-dlp。
+    """
+    from bilibili_downloader import is_bilibili_url, download_bilibili_audio
+
     print(f"{'=' * 50}\n 视频音频提取\n{'=' * 50}")
 
-    # 探针
-    probe = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "--dump-json", "--no-playlist", url],
-        capture_output=True, text=False, timeout=30,
-    )
-    if probe.returncode != 0:
-        err = probe.stderr.decode("utf-8", errors="replace").strip()[:300]
-        print(f"\n[错误] 无法获取该视频\n       可能原因：视频已被删除 / 私密 / 区域限制\n       yt-dlp: {err}")
-        raise RuntimeError(f"视频获取失败: {err}")
+    if is_bilibili_url(url):
+        # B站原生 API 路径
+        audio_path, info = download_bilibili_audio(url)
+        video_title = info["title"]
+        video_uploader = info["uploader"]
+        print(f"[标题]   {video_title}\n[UP主]   {video_uploader}")
+    else:
+        # yt-dlp 路径（YouTube 等）
+        probe = subprocess.run(
+            [sys.executable, "-m", "yt_dlp", "--dump-json", "--no-playlist", url],
+            capture_output=True, text=False, timeout=30,
+        )
+        if probe.returncode != 0:
+            err = probe.stderr.decode("utf-8", errors="replace").strip()[:300]
+            print(f"\n[错误] 无法获取该视频\n       可能原因：视频已被删除 / 私密 / 区域限制\n       yt-dlp: {err}")
+            raise RuntimeError(f"视频获取失败: {err}")
 
-    info = json.loads(probe.stdout.decode("utf-8"))
-    video_title = info.get("title", "视频")
-    video_uploader = info.get("uploader", info.get("channel", ""))
-    print(f"[标题]   {video_title}\n[UP主]   {video_uploader}")
+        info = json.loads(probe.stdout.decode("utf-8"))
+        video_title = info.get("title", "视频")
+        video_uploader = info.get("uploader", info.get("channel", ""))
+        print(f"[标题]   {video_title}\n[UP主]   {video_uploader}")
+
+        try:
+            audio_path = download_video_audio(url)
+        except RuntimeError as e:
+            print(f"\n[错误] 音频下载失败: {e}")
+            raise
 
     session_dir = create_session_dir(video_title, video_uploader, f"video_{hash(url) & 0xFFFFFFFF:08x}", 0)
     session_dir.mkdir(parents=True, exist_ok=True)
     print(f"[输出] {session_dir}")
 
     # 转写
-    if WHISPER_MODE == "stream":
-        print(f"\n--- 流式转写（边下边转） ---")
-        text = transcribe_video_streaming(url, scene)
-    else:
-        try:
-            audio_path = download_video_audio(url)
-        except RuntimeError as e:
-            if session_dir.exists() and not any(session_dir.iterdir()):
-                session_dir.rmdir()
-            print(f"\n[错误] 音频下载失败: {e}")
-            raise
-        target = session_dir / "audio.wav"
-        shutil.move(str(audio_path), str(target))
-        print(f"\n--- 开始转写 ---")
-        text = transcribe(target, scene)
+    target = session_dir / "audio.wav"
+    shutil.move(str(audio_path), str(target))
+    print(f"\n--- 开始转写 ---")
+    text = transcribe(target, scene)
 
     save_transcript(text, session_dir)
 
     # 总结
+    if not no_summarize:
+        print(f"\n--- 生成简报 ---")
+        summary = generate_summary(text, scene=scene, title="", use_api=True)
+        summary_path = save_summary(summary, session_dir)
+        print(f"[保存] 简报: {summary_path}")
+
+    print(f"\n{'=' * 50}\n 完成！\n 输出目录: {session_dir}")
+    return session_dir
+
+
+def process_local_video(
+    video_path: Path,
+    scene: str = "general",
+    no_summarize: bool = False,
+) -> Path:
+    """本地视频文件：提取音频 → 转写 → 总结，返回 session_dir"""
+    from bilibili_downloader import extract_local_video_audio
+
+    if not video_path.exists():
+        raise FileNotFoundError(f"视频文件不存在: {video_path}")
+
+    print(f"{'=' * 50}\n 本地视频提取\n{'=' * 50}")
+    print(f"[文件]   {video_path.name}")
+    print(f"[大小]   {video_path.stat().st_size / 1024 / 1024:.1f} MB")
+
+    audio_path = extract_local_video_audio(video_path)
+
+    session_dir = create_session_dir(video_path.stem, "", "local", 0)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[输出] {session_dir}")
+
+    target = session_dir / "audio.wav"
+    shutil.move(str(audio_path), str(target))
+
+    print(f"\n--- 开始转写 ---")
+    text = transcribe(target, scene)
+    save_transcript(text, session_dir)
+
     if not no_summarize:
         print(f"\n--- 生成简报 ---")
         summary = generate_summary(text, scene=scene, title="", use_api=True)

@@ -12,7 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from pipeline import process_live, process_video, process_audio
+from pipeline import process_live, process_video, process_audio, process_local_video
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     input_group.add_argument("--url", "-u",    help="Bilibili 直播间链接")
     input_group.add_argument("--video", "-v",  help="视频链接（任意平台）")
     input_group.add_argument("--audio", "-a",  type=Path, help="本地音频文件")
+    input_group.add_argument("--local-video", type=Path, help="本地视频文件（提取音频后转写）")
     input_group.add_argument("--daemon",       action="store_true", help="启动队列守护进程（模型常驻，排队处理）")
     input_group.add_argument("--enqueue",      action="store_true", help="提交任务到队列并退出（需配合 --url/--video/--audio）")
     input_group.add_argument("--queue-status", action="store_true", help="查看队列状态（pending/running/done/failed）")
@@ -112,7 +113,15 @@ def main():
             print(f"[队列] 查看结果: queue/done/job_{job_id}.json")
         return
 
-    # ── 模式A：本地音频 ──
+    # ── 模式A1：本地视频 ──
+    if args.local_video:
+        try:
+            process_local_video(args.local_video, scene, no_summarize=args.no_summarize)
+        except (FileNotFoundError, RuntimeError) as e:
+            print(f"[错误] {e}")
+            sys.exit(1)
+
+    # ── 模式A2：本地音频 ──
     if args.audio:
         try:
             process_audio(args.audio, scene, no_summarize=args.no_summarize)
