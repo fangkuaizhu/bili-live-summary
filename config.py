@@ -44,7 +44,7 @@ def _get(key: str, default=""):
 # ========== Whisper 设置 ==========
 WHISPER_MODEL = "large-v3-turbo"
 WHISPER_DEVICE = "cuda"
-WHISPER_COMPUTE_TYPE = "float16"
+WHISPER_COMPUTE_TYPE = "float32"  # Blackwell RTX 5070 Ti 需 float32 规避 cuBLAS 不兼容（12GB GDDR7 可容纳）
 WHISPER_BEAM_SIZE = 3       # 解码搜索宽度，越小越快（3=快速, 5=平衡, 8=最准）
 # 转写模式: "batch" = 下载完再转写 / "stream" = 边下边转写
 WHISPER_MODE = "batch"

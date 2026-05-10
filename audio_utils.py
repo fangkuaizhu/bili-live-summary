@@ -98,12 +98,19 @@ def transcode_to_wav(input_path: Path, output_path: Path) -> Path:
 
 
 def _transcode_to_wav(src: Path, dst: Path) -> Path:
-    """内部：av 转码为 16kHz mono WAV"""
+    """内部：av 转码为 16kHz mono WAV（使用 AudioResampler 正确重采样）"""
     in_ctr = None
     out_ctr = None
     try:
         in_ctr = av.open(str(src))
         audio_stream = in_ctr.streams.audio[0]
+
+        # 创建重采样器
+        resampler = av.AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=16000,
+        )
 
         out_ctr = av.open(str(dst), "w")
         out_stream = out_ctr.add_stream("pcm_s16le", 16000)
@@ -112,16 +119,29 @@ def _transcode_to_wav(src: Path, dst: Path) -> Path:
         for packet in in_ctr.demux(audio_stream):
             for frame in packet.decode():
                 if frame.samples > 0:
+                    # 混音为单声道
                     arr = frame.to_ndarray()
                     if len(arr.shape) > 1:
-                        arr = arr.mean(axis=0)
-                    arr = (arr * 32767).clip(-32768, 32767).astype("int16")
-                    new_frame = av.AudioFrame.from_ndarray(
-                        arr.reshape(1, -1), format="s16", layout="mono"
+                        arr = arr.mean(axis=0, keepdims=True)
+                    else:
+                        arr = arr.reshape(1, -1)
+
+                    # 用 resampler 正确重采样
+                    in_frame = av.AudioFrame.from_ndarray(
+                        arr, format="fltp", layout="mono"
                     )
-                    new_frame.sample_rate = 16000
-                    for pkt in out_stream.encode(new_frame):
-                        out_ctr.mux(pkt)
+                    in_frame.sample_rate = frame.sample_rate
+
+                    for out_frame in resampler.resample(in_frame):
+                        out_frame.pts = None
+                        for pkt in out_stream.encode(out_frame):
+                            out_ctr.mux(pkt)
+
+        # 刷新重采样器
+        for out_frame in resampler.resample(None):
+            out_frame.pts = None
+            for pkt in out_stream.encode(out_frame):
+                out_ctr.mux(pkt)
 
         for pkt in out_stream.encode(None):
             out_ctr.mux(pkt)

@@ -16,17 +16,38 @@ from typing import Optional
 
 
 def _setup_cuda_paths():
-    """Windows 下将 pip 安装的 CUDA DLL 路径加入 PATH"""
+    """Windows 下将 pip 安装的 CUDA DLL 路径加入 DLL 搜索路径
+
+    遍历 nvidia 命名空间下所有子包，将其 bin/ 目录同时加入 DLL 搜索路径
+    (os.add_dll_directory) 和 PATH 环境变量，以确保 ctranslate2 的 C++ 绑定
+    能够在 encode 时正确找到 cublas/cudnn/cudart 等运行时库。
+    """
     if sys.platform != "win32":
         return
     try:
         import nvidia
         nv_dir = nvidia.__path__[0]
-        for sub in ["cublas", "cuda_nvrtc"]:
-            bin_dir = os.path.join(nv_dir, sub, "bin")
-            if os.path.isdir(bin_dir) and bin_dir not in os.environ.get("PATH", ""):
-                os.environ["PATH"] = bin_dir + ";" + os.environ.get("PATH", "")
-    except (ImportError, AttributeError):
+        bin_dirs = []
+        for entry in os.scandir(nv_dir):
+            if entry.is_dir():
+                bin_dir = os.path.join(entry.path, "bin")
+                if os.path.isdir(bin_dir):
+                    bin_dirs.append(bin_dir)
+        # 同时使用两种方式注册 DLL 路径
+        for d in bin_dirs:
+            os.add_dll_directory(d)
+            if d not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+        # 预加载核心 CUDA DLL，提前解析依赖链
+        import ctypes
+        for d in bin_dirs:
+            for f in os.scandir(d):
+                if f.is_file() and f.name.endswith(".dll") and f.name.startswith(("cublas", "cudart", "cudnn")):
+                    try:
+                        ctypes.CDLL(str(f.path))
+                    except Exception:
+                        pass
+    except (ImportError, AttributeError, OSError):
         pass
 
 

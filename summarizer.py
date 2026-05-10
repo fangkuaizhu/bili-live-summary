@@ -135,7 +135,7 @@ def _api_post(url: str, payload: dict, api_key: str) -> dict:
 #   MiniMax API（Anthropic 兼容接口）
 # ============================================
 
-def _call_minimax(text: str, instruction: str) -> str:
+def _call_minimax(text: str, instruction: str, max_tokens: int = 2048) -> str:
     from config import MINIMAX_MODEL
 
     api_key = _get_api_key("minimax")
@@ -146,7 +146,7 @@ def _call_minimax(text: str, instruction: str) -> str:
         "https://api.minimaxi.com/anthropic/v1/messages",
         {
             "model": MINIMAX_MODEL,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "system": "你是一个直播内容总结助手。用中文回复，简洁、有条理。",
             "messages": [
                 {"role": "user",
@@ -166,7 +166,7 @@ def _call_minimax(text: str, instruction: str) -> str:
 #   OpenAI 兼容接口（DeepSeek / 自定义）
 # ============================================
 
-def _call_openai(text: str, instruction: str) -> str:
+def _call_openai(text: str, instruction: str, max_tokens: int = 2048) -> str:
     from config import (
         SUMMARIZER_API,
         DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
@@ -188,7 +188,7 @@ def _call_openai(text: str, instruction: str) -> str:
         f"{base_url}/v1/chat/completions",
         {
             "model": model,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system",
                  "content": "你是一个直播/视频内容总结助手。用中文回复，简洁、有条理。"},
@@ -210,7 +210,7 @@ def _call_openai(text: str, instruction: str) -> str:
 #   统一入口
 # ============================================
 
-def summarize_with_api(text: str, scene: str = "general") -> str:
+def summarize_with_api(text: str, scene: str = "general", max_tokens: int = 2048) -> str:
     """根据 config.SUMMARIZER_API 自动选择平台"""
     from config import SUMMARIZER_API
 
@@ -218,9 +218,9 @@ def summarize_with_api(text: str, scene: str = "general") -> str:
     instruction = scene_cfg["summary_instruction"]
 
     if SUMMARIZER_API == "minimax":
-        return _call_minimax(text, instruction)
+        return _call_minimax(text, instruction, max_tokens)
     else:
-        return _call_openai(text, instruction)
+        return _call_openai(text, instruction, max_tokens)
 
 
 def generate_summary(text: str, scene: str = "general",
