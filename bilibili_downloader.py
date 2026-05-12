@@ -19,8 +19,13 @@ from config import TEMP_DIR
 from audio_utils import transcode_to_wav
 
 BILI_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Referer": "https://www.bilibili.com",
+    "Origin": "https://www.bilibili.com",
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Connection": "keep-alive",
 }
 
 
