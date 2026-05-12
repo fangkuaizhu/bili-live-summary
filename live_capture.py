@@ -12,6 +12,7 @@
 3. 截图：从直播流取一帧存为 jpg
 """
 
+import re
 import subprocess
 import sys
 import time
