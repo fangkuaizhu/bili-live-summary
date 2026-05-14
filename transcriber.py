@@ -195,9 +195,9 @@ def calibrate(
     should_fallback = False
 
     if quality["density"] == "silent" or quality["prompt_leak"]:
-        # 没人声 或 提示词泄漏 → 关 VAD，清提示词，自动检测语言
+        # 没人声 或 提示词泄漏 → 关 VAD，清提示词，保留原语言
         should_fallback = True
-        reasons.append("VAD 未检出有效人声 → 回退模式：关 VAD、清提示词、自动语言")
+        reasons.append("VAD 未检出有效人声 → 回退模式：关 VAD、清提示词，保留 zh")
 
     elif quality["density"] == "sparse":
         # 段太少：样本 30 秒只有 1-2 段，大概率 VAD 太激进
@@ -213,19 +213,34 @@ def calibrate(
     if should_fallback:
         params["vad_filter"] = False
         params["initial_prompt"] = None
-        params["language"] = None
         params["beam_size"] = 8
-        # 用 fallback 设置再测一次，确认改善
-        segs2, _ = model.transcribe(
-            str(sample), language=None,
-            vad_filter=False, beam_size=5, initial_prompt=None,
-        )
-        segs2_list = list(segs2)
-        q2 = _evaluate_quality(segs2_list, "")
-        if q2["num_segments"] > quality["num_segments"]:
-            # 检测到实际语言
-            detected_lang = info.language
-            reasons.append(f"回退后改善: {q2['num_segments']} 段/30s")
+        # 静默回退：先试原语言 zh，如果仍无声再切 auto
+        if quality["density"] == "silent":
+            params["language"] = "zh"  # 保留中文，避免 BGM 被误判为英文
+            # 用 zh + 关 VAD 再测一次
+            segs2, _ = model.transcribe(
+                str(sample), language="zh",
+                vad_filter=False, beam_size=5, initial_prompt=None,
+            )
+            segs2_list = list(segs2)
+            q2 = _evaluate_quality(segs2_list, "")
+            if q2["num_segments"] == 0:
+                # 确认真无声 → 切 auto
+                params["language"] = None
+                reasons.append("回退后仍无声 → 启用自动语言检测")
+            else:
+                reasons.append(f"回退后改善: {q2['num_segments']} 段/30s (保留 zh)")
+        else:
+            params["language"] = None
+            # 用 auto 再测一次
+            segs2, _ = model.transcribe(
+                str(sample), language=None,
+                vad_filter=False, beam_size=5, initial_prompt=None,
+            )
+            segs2_list = list(segs2)
+            q2 = _evaluate_quality(segs2_list, "")
+            if q2["num_segments"] > quality["num_segments"]:
+                reasons.append(f"回退后改善: {q2['num_segments']} 段/30s")
 
     if detected_prob < 0.5 and params["language"] is not None:
         params["language"] = None
