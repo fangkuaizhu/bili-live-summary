@@ -5,6 +5,7 @@
 """
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,29 @@ from pathlib import Path
 from typing import Optional
 
 from config import get_scene_config, OUTPUT_DIR, WHISPER_MODE, TEMP_DIR
+
+# ocr-local 项目路径（跨项目集成）
+OCR_LOCAL_DIR = r"H:/ocr-local"
+OCR_PYTHON = OCR_LOCAL_DIR + r"/ocr_env/Scripts/python.exe"
+OCR_CLI = OCR_LOCAL_DIR + r"/ocr_cli.py"
+OCR_QUEUE_DONE = OCR_LOCAL_DIR + r"/queue/done"
+
+
+def _status(mode: str, **kwargs) -> str:
+    """输出机器可读状态行，供 Agent 解析"""
+    # 结果描述
+    detected = kwargs.get("voice_detected") or kwargs.get("text_detected")
+    if mode == "whisper":
+        result = "voice_ok" if detected == "true" else "voice_low"
+    else:
+        result = "text_ok" if detected == "true" else "text_none"
+
+    parts = [f"mode={mode}", f"result={result}"]
+    for k, v in kwargs.items():
+        parts.append(f"{k}={v}")
+    line = "[STATUS] " + " | ".join(parts)
+    print(line, flush=True)
+    return line
 from live_capture import (
     capture_live as _capture_live,
     extract_room_id,
@@ -78,6 +102,8 @@ def process_live(
         print(f"[保存] 简报: {summary_path}")
 
     print(f"\n{'=' * 50}\n 完成！\n 输出目录: {session_dir}")
+    _status("whisper", voice_detected=str(len(text) > 50).lower(),
+            chars=str(len(text)), source="live")
     return session_dir
 
 
@@ -142,6 +168,8 @@ def process_video(
         print(f"[保存] 简报: {summary_path}")
 
     print(f"\n{'=' * 50}\n 完成！\n 输出目录: {session_dir}")
+    _status("whisper", voice_detected=str(len(text) > 50).lower(),
+            chars=str(len(text)), source="video")
     return session_dir
 
 
@@ -180,6 +208,166 @@ def process_local_video(
         print(f"[保存] 简报: {summary_path}")
 
     print(f"\n{'=' * 50}\n 完成！\n 输出目录: {session_dir}")
+    return session_dir
+
+
+def process_video_ocr(
+    url: str,
+    frame_interval: int = 12,
+    scene: str = "general",
+) -> Path:
+    """视频链接：下载 → 抽帧 → OCR（无配音视频专用），返回 session_dir"""
+    from bilibili_downloader import (
+        is_bilibili_url, extract_bv, get_video_info,
+        download_video_for_frames, extract_frames,
+    )
+
+    print(f"{'=' * 50}\n 视频 OCR 管道\n{'=' * 50}")
+
+    if not is_bilibili_url(url):
+        raise RuntimeError("OCR 管道目前仅支持 B站视频（BV号/完整链接/b23短链）")
+
+    bv = extract_bv(url)
+    info = get_video_info(bv)
+    video_title = info["title"]
+    video_uploader = info["uploader"]
+    total_sec = info.get("duration", 0)
+    print(f"[标题]   {video_title}\n[UP主]   {video_uploader}\n[时长]   {total_sec//60}分{total_sec%60}秒")
+
+    # 创建输出目录
+    session_dir = create_session_dir(video_title, video_uploader, bv, 0)
+    ocr_dir = session_dir / "ocr"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[输出]   {session_dir}")
+
+    # 下载视频
+    mp4_path = TEMP_DIR / f"{bv}_ocr_video.mp4"
+    frames_dir = TEMP_DIR / f"{bv}_ocr_frames"
+    total_frames = 0
+    raw_results = []
+    try:
+        download_video_for_frames(url, mp4_path)
+
+        # 抽帧
+        frames = extract_frames(mp4_path, frames_dir, interval=frame_interval)
+        if not frames:
+            raise RuntimeError("未抽取出任何帧")
+        total_frames = len(frames)
+
+        # 调用 ocr-local daemon 识别每一帧
+        print(f"\n--- OCR 识别（排队模式） ---")
+        import subprocess as _sp
+        import os as _os
+
+        # 第1步：批量提交所有帧
+        job_ids = []
+        for i, frame_path in enumerate(frames):
+            frame_sec = i * frame_interval
+            try:
+                r = _sp.run(
+                    [OCR_PYTHON, OCR_CLI,
+                     "--image", str(frame_path),
+                     "--lang", "ch",
+                     "--enqueue"],
+                    capture_output=True, encoding="utf-8", errors="replace", timeout=10,
+                    cwd=OCR_LOCAL_DIR,
+                    env={**_os.environ, "PYTHONIOENCODING": "utf-8"},
+                )
+                for line in r.stdout.split("\n"):
+                    if "任务ID:" in line:
+                        jid = line.split("任务ID:")[-1].strip()
+                        job_ids.append((frame_sec, jid))
+                        break
+                if frame_sec % 30 == 0:
+                    print(f"  [{frame_sec:4d}s] 已提交 {len(job_ids)}/{total_frames}", flush=True)
+            except Exception as e:
+                print(f"  [{frame_sec:4d}s] 提交失败: {e}")
+
+        if not job_ids:
+            raise RuntimeError("所有帧提交失败，请确认 ocr daemon 已运行")
+
+        # 第2步：轮询等待全部完成
+        print(f"\n  共 {len(job_ids)} 个任务，等待处理...")
+        raw_results = []
+        remaining = dict(job_ids)
+        poll_interval = 3
+        waited = 0
+        max_wait = 900
+
+        ocr_queue_done = Path(OCR_QUEUE_DONE)
+        ocr_queue_done.mkdir(parents=True, exist_ok=True)
+
+        while remaining and waited < max_wait:
+            time.sleep(poll_interval)
+            waited += poll_interval
+            done = []
+            for frame_sec, jid in list(remaining.items()):
+                done_file = ocr_queue_done / f"{jid}.json"
+                if done_file.exists():
+                    try:
+                        result = json.loads(done_file.read_text(encoding="utf-8"))
+                        blocks_raw = result.get("result", [])
+                        blocks = [b["text"].strip() for b in blocks_raw if len(b.get("text", "").strip()) >= 2]
+                        if blocks:
+                            raw_results.append((frame_sec, blocks))
+                    except Exception:
+                        pass
+                    done.append(frame_sec)
+            for sec in done:
+                del remaining[sec]
+            if done:
+                print(f"  [{waited}s] 完成 {len(done)}，剩余 {len(remaining)}")
+
+        if remaining:
+            print(f"  ⚠ {len(remaining)} 个任务超时未完成")
+        print(f"  OCR 完成: {len(raw_results)} 帧有效")
+
+        # 按时间排序
+        raw_results.sort(key=lambda x: x[0])
+
+        # 去重合并
+        print(f"\n--- 去重合并 ---")
+        deduped = []
+        prev_texts = None
+        for frame_sec, texts in raw_results:
+            joined = " | ".join(texts)
+            if joined != prev_texts:
+                mm, ss = divmod(frame_sec, 60)
+                deduped.append((mm, ss, joined))
+                prev_texts = joined
+        print(f"  {len(raw_results)} 帧 → {len(deduped)} 帧（去重后）")
+
+        # 写出 OCR 文本
+        ocr_text_path = ocr_dir / "ocr_text.txt"
+        lines = []
+        lines.append(f"# OCR 识别结果")
+        lines.append(f"# 视频: {video_title}")
+        lines.append(f"# UP主: {video_uploader}")
+        lines.append(f"# BV号: {bv}")
+        lines.append(f"# 总时长: {total_sec//60}分{total_sec%60}秒")
+        lines.append(f"# 抽帧间隔: {frame_interval}s | 总帧数: {total_frames}")
+        lines.append(f"# 有效帧: {len(deduped)}（去重后）")
+        lines.append("")
+        for mm, ss, text in deduped:
+            lines.append(f"[{mm:02d}:{ss:02d}] {text}")
+        lines.append("")
+        # 纯文本附录
+        lines.append("--- 纯文本拼接 ---")
+        lines.append("".join(t for _, _, t in deduped).replace(" | ", ""))
+
+        ocr_text_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"[保存] OCR 文本: {ocr_text_path}")
+
+    finally:
+        # 清理临时文件
+        mp4_path.unlink(missing_ok=True)
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir, ignore_errors=True)
+
+    print(f"\n{'=' * 50}\n 完成！\n 输出目录: {session_dir}\n OCR 文本: {ocr_dir / 'ocr_text.txt'}")
+    _status("ocr", text_detected=str(len(raw_results) >= 1).lower(),
+            frames=str(total_frames), effective=str(len(raw_results)),
+            chars=str(sum(len(t) for _, t in raw_results)))
     return session_dir
 
 

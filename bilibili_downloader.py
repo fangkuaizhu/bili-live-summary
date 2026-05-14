@@ -80,55 +80,20 @@ def get_video_pages(bv: str) -> list[dict]:
 
 
 def download_page_audio(bv: str, cid: int, page: int, output_path: Path) -> Path:
-    """
-    下载指定分P的音频流到 output_path
-    使用 B站原生 API 获取 CDN 地址，HTTP 下载后转码为 WAV
-    """
+    """下载指定分P的音频流到 output_path"""
     info = get_video_info(bv)
-
     print(f"[B站] 下载音频 P{page}: {info['title'][:30]}")
     start = time.time()
 
-    # 获取播放地址
-    resp = requests.get(
-        "https://api.bilibili.com/x/player/playurl",
-        params={"bvid": bv, "cid": cid, "qn": 32, "fnval": 0, "platform": "html5"},
-        headers=BILI_HEADERS, timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"获取播放地址失败: {data.get('message')}")
-    durls = data.get("data", {}).get("durl", [])
-    if not durls:
-        raise RuntimeError("未获取到视频流地址")
-
-    # 下载原始视频（一次性 GET，避免流式连接中断）
     temp = TEMP_DIR / f"_dl_{bv}_p{page}.mp4"
-    last_err = None
-    for attempt, d in enumerate(durls[:3]):
-        url = d["url"]
-        expected_size = d.get("size", 0)
-        try:
-            r = requests.get(url, headers=BILI_HEADERS, timeout=120)
-            r.raise_for_status()
-            temp.write_bytes(r.content)
-            # 验证大小
-            actual_size = temp.stat().st_size
-            if expected_size > 0 and actual_size < expected_size * 0.9:
-                raise RuntimeError(f"下载不完整: {actual_size}/{expected_size} bytes")
-            # 转码为 WAV（使用已修复的 _transcode_to_wav）
-            from audio_utils import transcode_to_wav
-            transcode_to_wav(temp, output_path)
-            if output_path.exists() and output_path.stat().st_size > 1000:
-                break
-        except Exception as e:
-            last_err = e
-            print(f"  CDN {attempt+1} 失败: {str(e)[:80]}")
-        finally:
-            temp.unlink(missing_ok=True)
-    else:
-        raise RuntimeError(f"所有 CDN 下载失败: {last_err}")
+    try:
+        _download_video_mp4(bv, cid, temp)
+        from audio_utils import transcode_to_wav
+        transcode_to_wav(temp, output_path)
+        if not output_path.exists() or output_path.stat().st_size < 1000:
+            raise RuntimeError("音频提取后文件无效")
+    finally:
+        temp.unlink(missing_ok=True)
 
     elapsed = time.time() - start
     mb = output_path.stat().st_size / 1024 / 1024
@@ -137,7 +102,7 @@ def download_page_audio(bv: str, cid: int, page: int, output_path: Path) -> Path
 
 
 def download_bilibili_audio(bv_or_url: str, output_path: Optional[Path] = None) -> tuple[Path, dict]:
-    """下载单P视频的音频（兼容旧接口，使用 yt-dlp）"""
+    """下载单P视频的音频（兼容旧接口，走 B站原生 API）"""
     bv = extract_bv(bv_or_url)
     info = get_video_info(bv)
     if output_path is None:
@@ -175,6 +140,93 @@ def extract_local_video_audio(video_path: Path, output_path: Optional[Path] = No
     mb = output_path.stat().st_size / 1024 / 1024
     print(f"[本地] 完成: {mb:.1f} MB, 耗时 {elapsed:.0f}s")
     return output_path
+
+
+def _download_video_mp4(bv: str, cid: int, output_mp4: Path, label: str = "") -> Path:
+    """
+    下载 B站视频 mp4 到指定路径（共享逻辑，供音频和帧提取使用）
+    调用方负责清理 output_mp4
+    """
+    label = f" {label}" if label else ""
+    print(f"[B站] 下载视频{label}: bv={bv}")
+    start = time.time()
+
+    resp = requests.get(
+        "https://api.bilibili.com/x/player/playurl",
+        params={"bvid": bv, "cid": cid, "qn": 32, "fnval": 0, "platform": "html5"},
+        headers=BILI_HEADERS, timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"获取播放地址失败: {data.get('message')}")
+    durls = data.get("data", {}).get("durl", [])
+    if not durls:
+        raise RuntimeError("未获取到视频流地址")
+
+    last_err = None
+    for attempt, d in enumerate(durls[:3]):
+        url = d["url"]
+        expected_size = d.get("size", 0)
+        try:
+            r = requests.get(url, headers=BILI_HEADERS, stream=True, timeout=(15, 120))
+            r.raise_for_status()
+            with open(output_mp4, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            actual_size = output_mp4.stat().st_size
+            if expected_size > 0 and actual_size < expected_size * 0.9:
+                raise RuntimeError(f"下载不完整: {actual_size}/{expected_size} bytes")
+            break
+        except Exception as e:
+            last_err = e
+            print(f"  CDN {attempt+1} 失败: {str(e)[:80]}")
+    else:
+        raise RuntimeError(f"所有 CDN 下载失败: {last_err}")
+
+    elapsed = time.time() - start
+    mb = output_mp4.stat().st_size / 1024 / 1024
+    print(f"[B站] 下载完成: {mb:.1f} MB, 耗时 {elapsed:.0f}s")
+    return output_mp4
+
+
+def download_video_for_frames(bv_or_url: str, output_mp4: Optional[Path] = None) -> tuple[Path, dict]:
+    """下载视频（完整 mp4）供帧提取使用，返回 (mp4路径, 视频信息)"""
+    bv = extract_bv(bv_or_url)
+    info = get_video_info(bv)
+    if output_mp4 is None:
+        output_mp4 = TEMP_DIR / f"{bv}_video.mp4"
+    _download_video_mp4(bv, info["cid"], output_mp4, label=info["title"][:30])
+    return output_mp4, info
+
+
+def extract_frames(video_mp4: Path, output_dir: Path, interval: int = 2, quality: int = 3) -> list[Path]:
+    """
+    从视频中按固定间隔抽取帧
+    返回帧文件路径列表（按时间排序）
+    quality: 1-5, 1 最高质量 (PNG 无损), 5 最低 (JPEG 低质量)
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fps = f"1/{interval}"
+    print(f"[抽帧] 间隔 {interval}s, 输出到 {output_dir}")
+
+    # 使用 imageio_ffmpeg 自带的 ffmpeg 二进制
+    import imageio_ffmpeg
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+    result = subprocess.run(
+        [ffmpeg, "-y", "-i", str(video_mp4),
+         "-vf", f"fps={fps}", "-q:v", str(quality),
+         str(output_dir / f"frame_%04d.jpg")],
+        capture_output=True, encoding="utf-8", errors="replace", timeout=300,
+    )
+    if result.returncode != 0 and not list(output_dir.glob("frame_*.jpg")):
+        raise RuntimeError(f"ffmpeg 抽帧失败: {result.stderr[-500:]}")
+
+    frames = sorted(output_dir.glob("frame_*.jpg"))
+    print(f"[抽帧] 完成: {len(frames)} 帧")
+    return frames
 
 
 def is_bilibili_url(url: str) -> bool:

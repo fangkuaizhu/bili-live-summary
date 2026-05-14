@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene", "-s",       default="general", choices=["general", "lecture", "streamer"], help="场景")
     parser.add_argument("--screenshot",        action="store_true", help="截取直播画面（仅 --url）")
     parser.add_argument("--no-summarize",      action="store_true", help="不自动总结")
+    parser.add_argument("--ocr",               action="store_true", help="OCR 管道（仅 --video）：抽帧 + 文字识别，用于无配音视频")
+    parser.add_argument("--ocr-interval",      type=int, default=5, help="OCR 抽帧间隔（秒，默认 5）")
     parser.add_argument("--wait",              action="store_true", help="提交队列任务后等待完成（需 --enqueue）")
     return parser
 
@@ -131,11 +133,19 @@ def main():
 
     # ── 模式B：视频链接 ──
     elif args.video:
-        try:
-            process_video(args.video, scene, no_summarize=args.no_summarize)
-        except RuntimeError as e:
-            print(f"[错误] {e}")
-            sys.exit(1)
+        if args.ocr:
+            from pipeline import process_video_ocr
+            try:
+                process_video_ocr(args.video, frame_interval=args.ocr_interval, scene=scene)
+            except RuntimeError as e:
+                print(f"[错误] {e}")
+                sys.exit(1)
+        else:
+            try:
+                process_video(args.video, scene, no_summarize=args.no_summarize)
+            except RuntimeError as e:
+                print(f"[错误] {e}")
+                sys.exit(1)
 
     # ── 模式C：B站直播 ──
     elif args.url:
