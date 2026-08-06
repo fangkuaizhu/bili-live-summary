@@ -48,6 +48,8 @@ WHISPER_COMPUTE_TYPE = "float32"  # Blackwell RTX 5070 Ti 需 float32 规避 cuB
 WHISPER_BEAM_SIZE = 3       # 解码搜索宽度，越小越快（3=快速, 5=平衡, 8=最准）
 # 转写模式: "batch" = 下载完再转写 / "stream" = 边下边转写
 WHISPER_MODE = "batch"
+# 热词注入: 是否启用热词功能
+HOTWORDS_ENABLED = True
 
 
 # ========== 总结 API 设置 ==========

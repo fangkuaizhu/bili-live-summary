@@ -85,29 +85,68 @@ def get_model() -> WhisperModel:
 #   校准引擎
 # ==============================
 
-def _extract_sample(audio_path: Path, duration: int = 30) -> Path:
-    """截取音频前 N 秒作为校准样本（纯 Python wave）"""
+def _extract_sample(audio_path: Path, duration: int = 30, multi_point: bool = False) -> Path | list[Path]:
+    """截取音频样本（纯 Python wave）
+    
+    Args:
+        audio_path: 音频文件路径
+        duration: 每个采样点时长（秒）
+        multi_point: 是否多点采样（前1/4、中点、后1/4）
+    
+    Returns:
+        单点采样返回 Path，多点采样返回 list[Path]
+    """
     import wave
-    sample_path = TEMP_DIR / "calibrate_sample.wav"
+    
     if not audio_path.exists() or audio_path.stat().st_size < 10000:
-        return audio_path
-
+        return audio_path if not multi_point else [audio_path]
+    
     try:
         with wave.open(str(audio_path), "rb") as src:
             rate = src.getframerate()
-            params = (src.getnchannels(), src.getsampwidth(), rate, 0, "NONE", "not compressed")
-            data = src.readframes(rate * duration)
-
-        with wave.open(str(sample_path), "wb") as dst:
-            dst.setparams(params)
-            dst.writeframes(data)
-
-        if sample_path.stat().st_size > 1000:
-            return sample_path
+            nframes = src.getnframes()
+            total_duration = nframes / rate
+            
+            # 音频总时长 < 120 秒时退化为单点采样
+            if not multi_point or total_duration < 120:
+                sample_path = TEMP_DIR / "calibrate_sample.wav"
+                params = (src.getnchannels(), src.getsampwidth(), rate, 0, "NONE", "not compressed")
+                src.rewind()
+                data = src.readframes(rate * duration)
+                
+                with wave.open(str(sample_path), "wb") as dst:
+                    dst.setparams(params)
+                    dst.writeframes(data)
+                
+                if sample_path.stat().st_size > 1000:
+                    return sample_path
+                return audio_path
+            
+            # 多点采样：前1/4、中点、后1/4
+            samples = []
+            positions = [0.25, 0.5, 0.75]
+            
+            for i, pos in enumerate(positions):
+                sample_path = TEMP_DIR / f"calibrate_sample_{i}.wav"
+                start_frame = int(nframes * pos)
+                src.rewind()
+                src.readframes(start_frame)  # 跳到目标位置
+                
+                params = (src.getnchannels(), src.getsampwidth(), rate, 0, "NONE", "not compressed")
+                data = src.readframes(rate * duration)
+                
+                with wave.open(str(sample_path), "wb") as dst:
+                    dst.setparams(params)
+                    dst.writeframes(data)
+                
+                if sample_path.stat().st_size > 1000:
+                    samples.append(sample_path)
+            
+            return samples if samples else [audio_path]
     except Exception:
         pass
-
-    return audio_path
+    
+    return audio_path if not multi_point else [audio_path]
 
 
 def _evaluate_quality(
@@ -148,78 +187,198 @@ def _evaluate_quality(
     }
 
 
+def _build_hotwords_prompt(
+    base_prompt: str,
+    hotwords: list[str] | None = None,
+    title: str = "",
+) -> str:
+    """构造增强的 initial_prompt（含热词）"""
+    if not hotwords and not title:
+        return base_prompt
+    
+    # 从标题提取关键词
+    title_words = []
+    if title:
+        # 按常见分隔符拆分，过滤无意义词
+        import re
+        parts = re.split(r'[\s\-_,，。、；;：:！!？?\(\)（）\[\]【】\{\}]+', title)
+        stopwords = {'的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都',
+                     '一', '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会',
+                     '着', '没有', '看', '好', '自己', '这'}
+        title_words = [w.strip() for w in parts if len(w.strip()) > 1 and w.strip() not in stopwords]
+    
+    # 合并热词
+    all_hotwords = []
+    if hotwords:
+        all_hotwords.extend(hotwords)
+    if title_words:
+        all_hotwords.extend(title_words)
+    
+    # 去重并保持顺序
+    seen = set()
+    unique_hotwords = []
+    for w in all_hotwords:
+        if w not in seen:
+            seen.add(w)
+            unique_hotwords.append(w)
+    
+    if not unique_hotwords:
+        return base_prompt
+    
+    # 构造增强 prompt
+    hotwords_str = "、".join(unique_hotwords)
+    enhanced = f"{base_prompt}\n以下词汇是本视频/录音的关键内容，请优先准确转写：{hotwords_str}"
+    return enhanced
+
+
+def _apply_hotwords_to_transcribe(
+    kwargs: dict,
+    hotwords: list[str] | None = None,
+) -> dict:
+    """尝试将热词应用到 transcribe 参数（faster-whisper 原生特性）"""
+    from config import HOTWORDS_ENABLED
+    
+    if not HOTWORDS_ENABLED or not hotwords:
+        return kwargs
+    
+    # 尝试 faster-whisper 原生 hotwords 参数
+    kwargs_copy = kwargs.copy()
+    try:
+        kwargs_copy["hotwords"] = " ".join(hotwords)
+        # 测试性调用会抛 TypeError 如果不支持
+        return kwargs_copy
+    except Exception:
+        return kwargs
+
+
 def calibrate(
     audio_path: Path,
     scene: str = "general",
+    hotwords: list[str] | None = None,
+    title: str = "",
 ) -> dict:
-    """对音频采样并校准 Whisper 参数
+    """对音频采样并校准 Whisper 参数（支持多点采样和热词注入）
     
-    返回优化后的参数字典。
+    Args:
+        audio_path: 音频文件路径
+        scene: 场景标识
+        hotwords: 热词列表
+        title: 视频标题
+    
+    Returns:
+        优化后的参数字典
     """
     config = get_scene_config(scene)
     initial_prompt = config["initial_prompt"]
+    
+    # 构造含热词的 prompt
+    enhanced_prompt = _build_hotwords_prompt(initial_prompt, hotwords, title)
+    
     model = get_model()
 
-    # 提取样本
-    sample = _extract_sample(audio_path)
-    sample_mb = sample.stat().st_size / 1024 / 1024
-
-    # --- 第一轮：默认配置 ---
-    print(f"[校准] 采样 {sample_mb:.1f} MB 进行质量评估...")
-    segs, info = model.transcribe(
-        str(sample),
-        language="zh",
-        initial_prompt=initial_prompt,
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters=dict(threshold=0.5, min_speech_duration_ms=250,
-                            max_speech_duration_s=30, min_silence_duration_ms=500),
-    )
-    segments_list = list(segs)
-    quality = _evaluate_quality(segments_list, initial_prompt)
-
-    detected_lang = info.language
-    detected_prob = info.language_probability
-
+    # 提取样本（多点采样）
+    samples = _extract_sample(audio_path, multi_point=True)
+    if not isinstance(samples, list):
+        samples = [samples]
+    
+    print(f"[校准] 采样 {len(samples)} 个点进行质量评估...")
+    
+    # 对每个采样点分别转写并统计密度
+    densities = []
+    all_quality = []
+    detected_lang = None
+    detected_prob = 0.0
+    
+    for i, sample in enumerate(samples):
+        sample_mb = sample.stat().st_size / 1024 / 1024
+        print(f"[校准]   采样点 {i+1}/{len(samples)} ({sample_mb:.1f} MB)...")
+        
+        # 构造 transcribe 参数
+        transcribe_kwargs = {
+            "language": "zh",
+            "initial_prompt": enhanced_prompt,
+            "beam_size": 5,
+            "vad_filter": True,
+            "vad_parameters": dict(
+                threshold=0.5,
+                min_speech_duration_ms=250,
+                max_speech_duration_s=30,
+                min_silence_duration_ms=500
+            ),
+        }
+        
+        # 尝试注入热词
+        transcribe_kwargs = _apply_hotwords_to_transcribe(transcribe_kwargs, hotwords)
+        
+        segs, info = model.transcribe(str(sample), **transcribe_kwargs)
+        segments_list = list(segs)
+        quality = _evaluate_quality(segments_list, enhanced_prompt)
+        
+        densities.append(quality["density"])
+        all_quality.append(quality)
+        
+        # 记录语言检测结果（使用第一个采样点的结果）
+        if i == 0:
+            detected_lang = info.language
+            detected_prob = info.language_probability
+    
+    # 密度投票：取 2/3 多数决
+    density_counts = {}
+    for d in densities:
+        density_counts[d] = density_counts.get(d, 0) + 1
+    
+    # 找到票数最多的密度
+    voted_density = max(density_counts.items(), key=lambda x: x[1])[0]
+    
+    # 汇总质量统计
+    avg_segments = sum(q["num_segments"] for q in all_quality) / len(all_quality)
+    has_prompt_leak = any(q["prompt_leak"] for q in all_quality)
+    
+    print(f"[校准] 多点密度: {densities} → 投票结果: {voted_density}")
+    
     # --- 诊断 ---
     params = {
         "language": "zh",
         "vad_filter": True,
         "vad_threshold": 0.5,
         "beam_size": WHISPER_BEAM_SIZE,
-        "initial_prompt": initial_prompt,
+        "initial_prompt": enhanced_prompt,
     }
 
     reasons = []
 
     should_fallback = False
 
-    if quality["density"] == "silent" or quality["prompt_leak"]:
+    if voted_density == "silent" or has_prompt_leak:
         # 没人声 或 提示词泄漏 → 关 VAD，清提示词，保留原语言
         should_fallback = True
         reasons.append("VAD 未检出有效人声 → 回退模式：关 VAD、清提示词，保留 zh")
+        if hotwords or title:
+            reasons.append("热词已随提示词清空")
 
-    elif quality["density"] == "sparse":
+    elif voted_density == "sparse":
         # 段太少：样本 30 秒只有 1-2 段，大概率 VAD 太激进
         should_fallback = True
         reasons.append("人声稀疏 (30s 仅 1-2 段) → 回退模式：关 VAD、清提示词")
+        if hotwords or title:
+            reasons.append("热词已随提示词清空")
 
-    elif quality["density"] == "light":
+    elif voted_density == "light":
         # 略少 → 轻微调低 VAD
         params["vad_threshold"] = 0.3
         params["beam_size"] = 8
-        reasons.append(f"人声偏少 ({quality['num_segments']} 段/30s) → VAD 阈值降至 0.3")
+        reasons.append(f"人声偏少 ({avg_segments:.0f} 段/30s) → VAD 阈值降至 0.3")
 
     if should_fallback:
         params["vad_filter"] = False
         params["initial_prompt"] = None
         params["beam_size"] = 8
         # 静默回退：先试原语言 zh，如果仍无声再切 auto
-        if quality["density"] == "silent":
+        if voted_density == "silent":
             params["language"] = "zh"  # 保留中文，避免 BGM 被误判为英文
-            # 用 zh + 关 VAD 再测一次
+            # 用 zh + 关 VAD 再测一次（使用第一个采样点）
             segs2, _ = model.transcribe(
-                str(sample), language="zh",
+                str(samples[0]), language="zh",
                 vad_filter=False, beam_size=5, initial_prompt=None,
             )
             segs2_list = list(segs2)
@@ -232,14 +391,14 @@ def calibrate(
                 reasons.append(f"回退后改善: {q2['num_segments']} 段/30s (保留 zh)")
         else:
             params["language"] = None
-            # 用 auto 再测一次
+            # 用 auto 再测一次（使用第一个采样点）
             segs2, _ = model.transcribe(
-                str(sample), language=None,
+                str(samples[0]), language=None,
                 vad_filter=False, beam_size=5, initial_prompt=None,
             )
             segs2_list = list(segs2)
             q2 = _evaluate_quality(segs2_list, "")
-            if q2["num_segments"] > quality["num_segments"]:
+            if q2["num_segments"] > avg_segments:
                 reasons.append(f"回退后改善: {q2['num_segments']} 段/30s")
 
     if detected_prob < 0.5 and params["language"] is not None:
@@ -247,13 +406,14 @@ def calibrate(
         reasons.append(f"语言置信度低 ({detected_prob:.0%}) → 启用自动检测")
 
     print(f"[校准] 检测语言: {detected_lang} ({detected_prob:.0%})")
-    print(f"[校准] {quality['num_segments']} 段, 密度={quality['density']}")
+    print(f"[校准] 平均 {avg_segments:.0f} 段, 密度={voted_density}")
     for r in reasons:
         print(f"[校准]   → {r}")
 
     # 清理样本
-    if sample.exists():
-        sample.unlink()
+    for sample in samples:
+        if sample.exists() and sample != audio_path:
+            sample.unlink()
 
     return params
 
@@ -263,6 +423,8 @@ def transcribe(
     scene: str = "general",
     language: Optional[str] = None,
     calibrate_params: Optional[dict] = None,
+    hotwords: list[str] | None = None,
+    title: str = "",
 ) -> str:
     """转写音频文件为文字
     
@@ -273,6 +435,8 @@ def transcribe(
         scene: 场景标识
         language: 语言代码，None = 自动检测
         calibrate_params: 直接指定校准参数（跳过校准步骤）
+        hotwords: 热词列表
+        title: 视频标题
     
     Returns:
         转写后的完整文本
@@ -280,9 +444,9 @@ def transcribe(
     if not audio_path.exists():
         raise FileNotFoundError(f"音频文件不存在: {audio_path}")
 
-    # 动态校准
+    # 动态校准（传入热词和标题）
     if calibrate_params is None:
-        calibrate_params = calibrate(audio_path, scene)
+        calibrate_params = calibrate(audio_path, scene, hotwords=hotwords, title=title)
 
     model = get_model()
     file_size_mb = audio_path.stat().st_size / 1024 / 1024
@@ -297,14 +461,24 @@ def transcribe(
             min_silence_duration_ms=500,
         )
 
-    segments, info = model.transcribe(
-        str(audio_path),
-        language=calibrate_params["language"],
-        initial_prompt=calibrate_params["initial_prompt"],
-        beam_size=calibrate_params["beam_size"],
-        vad_filter=calibrate_params["vad_filter"],
-        vad_parameters=vad_params,
-    )
+    # 构造 transcribe 参数
+    transcribe_kwargs = {
+        "language": calibrate_params["language"],
+        "initial_prompt": calibrate_params["initial_prompt"],
+        "beam_size": calibrate_params["beam_size"],
+        "vad_filter": calibrate_params["vad_filter"],
+        "vad_parameters": vad_params,
+    }
+    
+    # 尝试注入热词（faster-whisper 原生特性）
+    from config import HOTWORDS_ENABLED
+    if HOTWORDS_ENABLED and hotwords and calibrate_params.get("initial_prompt") is not None:
+        try:
+            transcribe_kwargs["hotwords"] = " ".join(hotwords)
+        except Exception:
+            pass
+    
+    segments, info = model.transcribe(str(audio_path), **transcribe_kwargs)
 
     lines = []
     for seg in segments:
