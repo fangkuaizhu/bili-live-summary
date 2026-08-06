@@ -45,6 +45,7 @@ from live_capture import (
 )
 from transcriber import transcribe, transcribe_video_streaming, transcribe_live_streaming, get_model
 from summarizer import create_session_dir, save_transcript, save_summary, generate_summary
+from corrector import correct_transcript
 
 
 def process_live(
@@ -53,6 +54,7 @@ def process_live(
     scene: str = "general",
     screenshot: bool = False,
     no_summarize: bool = False,
+    correct: bool = True,
 ) -> Path:
     """B站直播间：录制 → 转写 → 总结，返回 session_dir
     duration=None 即跟播到结束"""
@@ -61,13 +63,15 @@ def process_live(
     # 获取直播间信息
     try:
         status = get_live_status(room_id)
+        live_title = status.get("title", room_id)
         session_dir = create_session_dir(
-            status.get("title", room_id),
+            live_title,
             status.get("uploader", ""),
             room_id,
             duration,
         )
     except Exception:
+        live_title = room_id
         session_dir = create_session_dir(room_id, "", room_id, duration)
     session_dir.mkdir(parents=True, exist_ok=True)
     print(f"[输出] {session_dir}")
@@ -93,6 +97,14 @@ def process_live(
 
     save_transcript(text, session_dir)
 
+    # 二轮纠错
+    if correct:
+        print(f"\n--- LLM 二轮纠错 ---")
+        corrected = correct_transcript(text, scene=scene, title=live_title, use_api=True)
+        corrected_path = session_dir / "transcript_corrected.txt"
+        corrected_path.write_text(corrected, encoding="utf-8")
+        print(f"[纠错] 保存: {corrected_path}")
+
     # 总结
     if not no_summarize:
         print(f"\n--- 生成简报 ---")
@@ -111,20 +123,26 @@ def process_video(
     url: str,
     scene: str = "general",
     no_summarize: bool = False,
+    correct: bool = True,
 ) -> Path:
-    """视频链接：下载 → 转写 → 总结，返回 session_dir
+    """视频链接：下载 → 转写 → 总结（>30分钟自动切流式），返回 session_dir
     
     B站视频使用原生 API，其他平台走 yt-dlp。
     """
-    from bilibili_downloader import is_bilibili_url, download_bilibili_audio
+    from bilibili_downloader import (
+        is_bilibili_url, download_bilibili_audio,
+        get_video_info, extract_bv,
+    )
 
     print(f"{'=' * 50}\n 视频音频提取\n{'=' * 50}")
 
     if is_bilibili_url(url):
-        # B站原生 API 路径
-        audio_path, info = download_bilibili_audio(url)
+        # B站原生 API：先获取信息（不下载），判断是否需要流式
+        bv = extract_bv(url)
+        info = get_video_info(bv)
         video_title = info["title"]
         video_uploader = info["uploader"]
+        duration = info.get("duration", 0)
         print(f"[标题]   {video_title}\n[UP主]   {video_uploader}")
     else:
         # yt-dlp 路径（YouTube 等）
@@ -140,25 +158,41 @@ def process_video(
         info = json.loads(probe.stdout.decode("utf-8"))
         video_title = info.get("title", "视频")
         video_uploader = info.get("uploader", info.get("channel", ""))
+        duration = info.get("duration", 0)
         print(f"[标题]   {video_title}\n[UP主]   {video_uploader}")
-
-        try:
-            audio_path = download_video_audio(url)
-        except RuntimeError as e:
-            print(f"\n[错误] 音频下载失败: {e}")
-            raise
 
     session_dir = create_session_dir(video_title, video_uploader, f"video_{hash(url) & 0xFFFFFFFF:08x}", 0)
     session_dir.mkdir(parents=True, exist_ok=True)
     print(f"[输出] {session_dir}")
 
-    # 转写
-    target = session_dir / "audio.wav"
-    shutil.move(str(audio_path), str(target))
-    print(f"\n--- 开始转写 ---")
-    text = transcribe(target, scene)
+    # 转写：B站超 30 分钟走流式，其余走 batch
+    if is_bilibili_url(url) and duration > 1800:
+        print(f"\n[切换] 视频时长 {duration // 60} 分钟 (>30 分钟)，使用流式转写")
+        text = transcribe_video_streaming(url, scene)
+    else:
+        if is_bilibili_url(url):
+            audio_path, _ = download_bilibili_audio(url)
+        else:
+            try:
+                audio_path = download_video_audio(url)
+            except RuntimeError as e:
+                print(f"\n[错误] 音频下载失败: {e}")
+                raise
+
+        target = session_dir / "audio.wav"
+        shutil.move(str(audio_path), str(target))
+        print(f"\n--- 开始转写 ---")
+        text = transcribe(target, scene, hotwords=None, title=video_title)
 
     save_transcript(text, session_dir)
+
+    # 二轮纠错
+    if correct:
+        print(f"\n--- LLM 二轮纠错 ---")
+        corrected = correct_transcript(text, scene=scene, title=video_title, use_api=True)
+        corrected_path = session_dir / "transcript_corrected.txt"
+        corrected_path.write_text(corrected, encoding="utf-8")
+        print(f"[纠错] 保存: {corrected_path}")
 
     # 总结
     if not no_summarize:
@@ -177,6 +211,7 @@ def process_local_video(
     video_path: Path,
     scene: str = "general",
     no_summarize: bool = False,
+    correct: bool = True,
 ) -> Path:
     """本地视频文件：提取音频 → 转写 → 总结，返回 session_dir"""
     from bilibili_downloader import extract_local_video_audio
@@ -200,6 +235,14 @@ def process_local_video(
     print(f"\n--- 开始转写 ---")
     text = transcribe(target, scene)
     save_transcript(text, session_dir)
+
+    # 二轮纠错
+    if correct:
+        print(f"\n--- LLM 二轮纠错 ---")
+        corrected = correct_transcript(text, scene=scene, title=video_path.stem, use_api=True)
+        corrected_path = session_dir / "transcript_corrected.txt"
+        corrected_path.write_text(corrected, encoding="utf-8")
+        print(f"[纠错] 保存: {corrected_path}")
 
     if not no_summarize:
         print(f"\n--- 生成简报 ---")
@@ -375,6 +418,7 @@ def process_audio(
     audio_path: Path,
     scene: str = "general",
     no_summarize: bool = False,
+    correct: bool = True,
 ) -> Path:
     """本地音频文件：转写 → 总结，返回 session_dir"""
     if not audio_path.exists():
@@ -385,6 +429,14 @@ def process_audio(
     session_dir = create_session_dir(audio_path.stem, "", "local", 0)
     session_dir.mkdir(parents=True, exist_ok=True)
     save_transcript(text, session_dir)
+
+    # 二轮纠错
+    if correct:
+        print(f"\n--- LLM 二轮纠错 ---")
+        corrected = correct_transcript(text, scene=scene, title=audio_path.stem, use_api=True)
+        corrected_path = session_dir / "transcript_corrected.txt"
+        corrected_path.write_text(corrected, encoding="utf-8")
+        print(f"[纠错] 保存: {corrected_path}")
 
     if not no_summarize:
         print(f"\n--- 生成简报 ---")

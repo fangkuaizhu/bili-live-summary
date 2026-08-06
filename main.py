@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene", "-s",       default="general", choices=["general", "lecture", "streamer"], help="场景")
     parser.add_argument("--screenshot",        action="store_true", help="截取直播画面（仅 --url）")
     parser.add_argument("--no-summarize",      action="store_true", help="不自动总结")
+    parser.add_argument("--no-correct",        action="store_true", help="跳过 LLM 二轮纠错")
     parser.add_argument("--ocr",               action="store_true", help="OCR 管道（仅 --video）：抽帧 + 文字识别，用于无配音视频")
     parser.add_argument("--ocr-interval",      type=int, default=5, help="OCR 抽帧间隔（秒，默认 5）")
     parser.add_argument("--wait",              action="store_true", help="提交队列任务后等待完成（需 --enqueue）")
@@ -50,6 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    # Windows GBK 控制台 UTF-8 输出修复
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     parser = build_parser()
     args = parser.parse_args()
     scene = args.scene if args.scene in ["general", "lecture", "streamer"] else "general"
@@ -118,7 +126,7 @@ def main():
     # ── 模式A1：本地视频 ──
     if args.local_video:
         try:
-            process_local_video(args.local_video, scene, no_summarize=args.no_summarize)
+            process_local_video(args.local_video, scene, no_summarize=args.no_summarize, correct=not args.no_correct)
         except (FileNotFoundError, RuntimeError) as e:
             print(f"[错误] {e}")
             sys.exit(1)
@@ -126,7 +134,7 @@ def main():
     # ── 模式A2：本地音频 ──
     if args.audio:
         try:
-            process_audio(args.audio, scene, no_summarize=args.no_summarize)
+            process_audio(args.audio, scene, no_summarize=args.no_summarize, correct=not args.no_correct)
         except FileNotFoundError as e:
             print(f"[错误] {e}")
             sys.exit(1)
@@ -142,7 +150,7 @@ def main():
                 sys.exit(1)
         else:
             try:
-                process_video(args.video, scene, no_summarize=args.no_summarize)
+                process_video(args.video, scene, no_summarize=args.no_summarize, correct=not args.no_correct)
             except RuntimeError as e:
                 print(f"[错误] {e}")
                 sys.exit(1)
@@ -172,6 +180,7 @@ def main():
                 scene=scene,
                 screenshot=args.screenshot,
                 no_summarize=args.no_summarize,
+                correct=not args.no_correct,
             )
         except RuntimeError as e:
             print(f"[错误] {e}")
