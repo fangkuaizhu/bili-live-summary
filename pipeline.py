@@ -98,6 +98,7 @@ def process_live(
     save_transcript(text, session_dir)
 
     # 二轮纠错
+    corrected = text  # 默认，纠错降级时仍用原文
     if correct:
         print(f"\n--- LLM 二轮纠错 ---")
         corrected = correct_transcript(text, scene=scene, title=live_title, use_api=True)
@@ -105,10 +106,13 @@ def process_live(
         corrected_path.write_text(corrected, encoding="utf-8")
         print(f"[纠错] 保存: {corrected_path}")
 
+    # 确定总结使用的文本（纠错可用时优先用纠错版本）
+    summary_text = corrected if (correct and corrected != text) else text
+
     # 总结
     if not no_summarize:
         print(f"\n--- 生成简报 ---")
-        enriched = _enrich_with_danmaku(text, session_dir)
+        enriched = _enrich_with_danmaku(summary_text, session_dir)
         summary = generate_summary(enriched, scene=scene, title="", use_api=True)
         summary_path = save_summary(summary, session_dir)
         print(f"[保存] 简报: {summary_path}")
@@ -187,6 +191,7 @@ def process_video(
     save_transcript(text, session_dir)
 
     # 二轮纠错
+    corrected = text  # 默认，纠错降级时仍用原文
     if correct:
         print(f"\n--- LLM 二轮纠错 ---")
         corrected = correct_transcript(text, scene=scene, title=video_title, use_api=True)
@@ -194,10 +199,13 @@ def process_video(
         corrected_path.write_text(corrected, encoding="utf-8")
         print(f"[纠错] 保存: {corrected_path}")
 
+    # 确定总结使用的文本（纠错可用时优先用纠错版本）
+    summary_text = corrected if (correct and corrected != text) else text
+
     # 总结
     if not no_summarize:
         print(f"\n--- 生成简报 ---")
-        summary = generate_summary(text, scene=scene, title="", use_api=True)
+        summary = generate_summary(summary_text, scene=scene, title="", use_api=True)
         summary_path = save_summary(summary, session_dir)
         print(f"[保存] 简报: {summary_path}")
 
@@ -237,6 +245,7 @@ def process_local_video(
     save_transcript(text, session_dir)
 
     # 二轮纠错
+    corrected = text  # 默认，纠错降级时仍用原文
     if correct:
         print(f"\n--- LLM 二轮纠错 ---")
         corrected = correct_transcript(text, scene=scene, title=video_path.stem, use_api=True)
@@ -244,9 +253,12 @@ def process_local_video(
         corrected_path.write_text(corrected, encoding="utf-8")
         print(f"[纠错] 保存: {corrected_path}")
 
+    # 确定总结使用的文本（纠错可用时优先用纠错版本）
+    summary_text = corrected if (correct and corrected != text) else text
+
     if not no_summarize:
         print(f"\n--- 生成简报 ---")
-        summary = generate_summary(text, scene=scene, title="", use_api=True)
+        summary = generate_summary(summary_text, scene=scene, title="", use_api=True)
         summary_path = save_summary(summary, session_dir)
         print(f"[保存] 简报: {summary_path}")
 
@@ -431,6 +443,7 @@ def process_audio(
     save_transcript(text, session_dir)
 
     # 二轮纠错
+    corrected = text  # 默认，纠错降级时仍用原文
     if correct:
         print(f"\n--- LLM 二轮纠错 ---")
         corrected = correct_transcript(text, scene=scene, title=audio_path.stem, use_api=True)
@@ -438,9 +451,12 @@ def process_audio(
         corrected_path.write_text(corrected, encoding="utf-8")
         print(f"[纠错] 保存: {corrected_path}")
 
+    # 确定总结使用的文本（纠错可用时优先用纠错版本）
+    summary_text = corrected if (correct and corrected != text) else text
+
     if not no_summarize:
         print(f"\n--- 生成简报 ---")
-        summary = generate_summary(text, scene=scene, title="", use_api=True)
+        summary = generate_summary(summary_text, scene=scene, title="", use_api=True)
         summary_path = save_summary(summary, session_dir)
         print(f"[保存] 简报: {summary_path}")
 
