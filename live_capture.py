@@ -52,15 +52,23 @@ def extract_room_id(url: str) -> str:
 
 def get_live_status(room_id: str) -> dict:
     """通过 B站官方 API 获取直播间基本信息（替代 yt-dlp，避免 SSL/解析不稳定）"""
-    import json, urllib.request
+    import json, requests
 
     api_url = f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={room_id}"
-    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-    except Exception as e:
-        raise RuntimeError(f"B站API请求失败: {e}")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(api_url, headers=headers, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    else:
+        raise RuntimeError(f"B站API请求失败: {last_err}")
 
     if data.get("code") != 0:
         raise RuntimeError(f"B站API返回错误: {data}")
@@ -70,12 +78,11 @@ def get_live_status(room_id: str) -> dict:
     # 尝试获取主播名（get_info 不含 uname，需额外接口）
     uploader = ""
     try:
-        req2 = urllib.request.Request(
+        r2 = requests.get(
             f"https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={room_id}",
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=headers, timeout=8,
         )
-        with urllib.request.urlopen(req2, timeout=10) as resp2:
-            d2 = json.loads(resp2.read())
+        d2 = r2.json()
         uploader = (d2.get("data") or {}).get("info", {}).get("uname", "") or ""
     except Exception:
         pass
@@ -90,17 +97,22 @@ def get_live_status(room_id: str) -> dict:
 
 def get_fresh_stream_url(room_id: str) -> str:
     """通过 B站官方 API 获取最新直播流地址（flv 格式，更稳定）"""
-    import json, urllib.request
+    import json, requests
     api_url = f"https://api.live.bilibili.com/room/v1/Room/playUrl?cid={room_id}&platform=web&qn=80"
-    req = urllib.request.Request(
-        api_url,
-        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://live.bilibili.com/"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-    except Exception as e:
-        raise RuntimeError(f"B站API请求失败: {e}")
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://live.bilibili.com/"}
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(api_url, headers=headers, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    else:
+        raise RuntimeError(f"B站API请求失败: {last_err}")
 
     if data.get("code") != 0:
         raise RuntimeError(f"B站API返回错误: {data}")
@@ -312,24 +324,17 @@ def capture_until_end(
     try:
         seg_index = 0
         while True:
-            # 检查是否还在播
+            # 检查是否还在播（API 抖动不中断跟播，仅作提示；直播结束靠分段录制失败兑底）
             try:
                 status = get_live_status(room_id)
                 if not status["is_live"]:
-                    elapsed = time.time() - start_time
-                    print(f"\n[跟播] 直播已结束，共录制 {elapsed:.0f} 秒")
-                    break
-            except Exception:
-                # API 报错（超时/连接失败），重试一次后仍失败则视为直播结束
-                import time as _t
-                _t.sleep(5)
-                try:
-                    status = get_live_status(room_id)
-                    if not status["is_live"]:
+                    # 状态接口可能滞后，用流探测确认后再判定结束
+                    if not _probe_live_stream(room_id):
+                        elapsed = time.time() - start_time
+                        print(f"\n[跟播] 直播已结束，共录制 {elapsed:.0f} 秒")
                         break
-                except Exception:
-                    print(f"\n[跟播] 无法获取直播状态，直播可能已结束")
-                    break
+            except Exception:
+                pass  # 状态 API 临时故障，忽略，继续录制
 
             part = TEMP_DIR / f"{room_id}_seg_{seg_index:04d}.wav"
             part_paths.append(part)
