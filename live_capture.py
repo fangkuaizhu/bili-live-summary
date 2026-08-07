@@ -51,22 +51,40 @@ def extract_room_id(url: str) -> str:
 
 
 def get_live_status(room_id: str) -> dict:
-    """获取直播间基本信息"""
-    result = _run(
-        [sys.executable, "-m", "yt_dlp", "--dump-json",
-         f"https://live.bilibili.com/{room_id}"],
-        capture_output=True, timeout=30,
-    )
-    if result.returncode != 0:
-        err = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"获取直播间信息失败:\n{err}")
-    import json
-    info = json.loads(result.stdout.decode("utf-8").strip().split("\n")[0])
+    """通过 B站官方 API 获取直播间基本信息（替代 yt-dlp，避免 SSL/解析不稳定）"""
+    import json, urllib.request
+
+    api_url = f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={room_id}"
+    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        raise RuntimeError(f"B站API请求失败: {e}")
+
+    if data.get("code") != 0:
+        raise RuntimeError(f"B站API返回错误: {data}")
+
+    info = data.get("data") or {}
+
+    # 尝试获取主播名（get_info 不含 uname，需额外接口）
+    uploader = ""
+    try:
+        req2 = urllib.request.Request(
+            f"https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={room_id}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req2, timeout=10) as resp2:
+            d2 = json.loads(resp2.read())
+        uploader = (d2.get("data") or {}).get("info", {}).get("uname", "") or ""
+    except Exception:
+        pass
+
     return {
         "title": info.get("title", "未知"),
-        "is_live": info.get("is_live", False),
-        "viewer_count": info.get("view_count", 0),
-        "uploader": info.get("uploader", ""),
+        "is_live": info.get("live_status") == 1,
+        "viewer_count": info.get("online", 0),
+        "uploader": uploader,
     }
 
 
@@ -92,6 +110,23 @@ def get_fresh_stream_url(room_id: str) -> str:
         raise RuntimeError("未获取到直播流地址，主播可能已下播")
 
     return durls[0]["url"]
+
+
+def _probe_live_stream(room_id: str) -> bool:
+    """预检：实际验证直播流 URL 是否有效（playUrl 可能返回 404 占位流）"""
+    try:
+        stream_url = get_fresh_stream_url(room_id)
+        import requests
+        r = requests.get(
+            stream_url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://live.bilibili.com"},
+            stream=True, timeout=10,
+        )
+        ok = r.status_code == 200
+        r.close()
+        return ok
+    except Exception:
+        return False
 
 
 # ==============================
@@ -174,15 +209,9 @@ def capture_fixed_duration(
     if output_path is None:
         output_path = TEMP_DIR / f"{room_id}_{duration}s.wav"
 
-    # 启动前预检：直播间是否在线
-    try:
-        status = get_live_status(room_id)
-        if not status["is_live"]:
-            raise RuntimeError(f"直播间 {room_id} 当前未开播")
-    except RuntimeError:
-        raise
-    except Exception:
-        pass  # API 不通就算了，继续尝试录制
+    # 启动前预检：直播间是否可获取直播流（playUrl 权威判断）
+    if not _probe_live_stream(room_id):
+        raise RuntimeError(f"直播间 {room_id} 当前未开播或无法获取直播流")
 
     # 启动弹幕采集
     collector = DanmakuCollector(room_id)
@@ -267,14 +296,8 @@ def capture_until_end(
     print(f"[跟播] 每段30秒自动续连，Ctrl+C 可手动停止")
 
     # 启动前预检
-    try:
-        status = get_live_status(room_id)
-        if not status["is_live"]:
-            raise RuntimeError(f"直播间 {room_id} 当前未开播")
-    except RuntimeError:
-        raise
-    except Exception:
-        pass
+    if not _probe_live_stream(room_id):
+        raise RuntimeError(f"直播间 {room_id} 当前未开播或无法获取直播流")
 
     # 启动弹幕采集
     collector = DanmakuCollector(room_id)
@@ -506,7 +529,8 @@ def capture_live(
 
     room_id = extract_room_id(url)
     status = get_live_status(room_id)
-    if not status["is_live"]:
+    # 预检用 playUrl 权威判断（live_status 接口可能滞后）
+    if not _probe_live_stream(room_id):
         raise RuntimeError(f"直播间 {room_id} 当前未开播")
 
     print(f"[直播间] {status['title']}")
