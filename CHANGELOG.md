@@ -13,6 +13,9 @@
 
 - **总结使用纠错后文本** — 原总结吃的是原始转写，导致 summary.md 残留「黄金龟脂」类错误；现纠错可用时总结优先使用纠错版本。
 - **Windows 控制台中文乱码** — `main.py` 入口对 stdout/stderr 执行 `reconfigure(encoding="utf-8")`，修复 PowerShell GBK 控制台下中文输出乱码及工具层输出目录解析失败。
+- **直播状态查询依赖 yt-dlp** — `get_live_status` 原通过 yt-dlp 获取直播间信息，在 SSL 报错时导致整个进程崩溃；改为调用 B站官方 API `get_info` + `get_anchor_in_room`。
+- **预检误判在播** — playUrl 在主播下播时也会返回 404 占位流，原预检只看是否有流地址导致误判；现会实际请求流 URL 验证 HTTP 200，下播房间秒级识别并快速失败。
+- **B站 API 偶发 SSL 错误导致跟播中断** — API 请求统一改用 requests + 指数退避重试（3 次）；跟播模式状态检查失败不再判定直播结束（API 抖动不中断，直播结束靠分段录制连续失败兜底）。
 
 ### 🔧 Internal
 
