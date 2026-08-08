@@ -48,8 +48,12 @@ CORRECTION_PROMPT = """你是一个 Whisper 语音转写纠错助手。请对以
 - 文本结构、段落、标点保持与原文本完全一致"""
 
 
-def _split_text(text: str, max_chunk: int = 15000) -> list:
-    """按段落将长文本分成多个批次，每批不超过 max_chunk 字符"""
+def _split_text(text: str, max_chunk: int = 6000) -> list:
+    """按段落将长文本分成多个批次，每批不超过 max_chunk 字符
+
+    max_chunk=6000：保证每批纠错输出（与原文本等长）在
+    max_tokens=8192 的安全范围内，避免 LLM 输出被截断。
+    """
     paragraphs = text.split("\n")
     chunks = []
     current = ""
@@ -83,7 +87,7 @@ def _call_minimax_correction(text: str) -> str:
             },
             json={
                 "model": MINIMAX_MODEL,
-                "max_tokens": 4096,
+                "max_tokens": 8192,
                 "system": CORRECTION_PROMPT,
                 "messages": [
                     {"role": "user", "content": text}
@@ -130,7 +134,7 @@ def _call_openai_compatible_correction(text: str) -> str:
             },
             json={
                 "model": model,
-                "max_tokens": 4096,
+                "max_tokens": 8192,
                 "messages": [
                     {"role": "system", "content": CORRECTION_PROMPT},
                     {"role": "user", "content": text},
@@ -177,8 +181,9 @@ def correct_transcript(
     if not use_api or not text or not text.strip():
         return text
 
-    # 超长文本分批处理
-    if len(text) > 20000:
+    # 超长文本分批处理（长于 8000 字符即分批，每批 6000，
+    # 防止 max_tokens 截断导致后半段丢失）
+    if len(text) > 8000:
         chunks = _split_text(text)
         corrected_chunks = []
         for i, chunk in enumerate(chunks):
