@@ -38,6 +38,10 @@
   - 短文本（≤阈值）走原单次调用路径，零回归。
 - **总结输出上限提升** — 段总结与最终合并 `max_tokens` 从 2048 提升至 `SUMMARY_MAX_OUTPUT_TOKENS`（默认 4096），防详细总结被截断。
 
+### 🐛 Bug Fixes
+
+- **merge 合并随机遗漏要点** — 合并阶段 `temperature=0.7` 导致长要点列表合并时随机遗漏细节（如某段独有的抽卡讨论可能被丢）；降为 0.2 并强化 prompt 要求“输出前逐条核对每段要点，宁多勿漏”，实测连跑 2 次关键要点均稳定保留。
+
 ### 🔧 Internal
 
 - `config.py`：新增 `SUMMARY_CHUNK_TOKENS` / `SUMMARY_OVERLAP_TOKENS` / `SUMMARY_CONTEXT_MODE` / `SUMMARY_MAX_OUTPUT_TOKENS`（可经 config.local.json 的 `summary.*` 覆盖）。

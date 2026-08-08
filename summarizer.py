@@ -142,7 +142,7 @@ def _api_post(url: str, payload: dict, api_key: str) -> dict:
 #   MiniMax API（Anthropic 兼容接口）
 # ============================================
 
-def _call_minimax(text: str, instruction: str, max_tokens: int = 2048) -> str:
+def _call_minimax(text: str, instruction: str, max_tokens: int = 2048, temperature: float = 0.7) -> str:
     from config import MINIMAX_MODEL
 
     api_key = _get_api_key("minimax")
@@ -154,6 +154,7 @@ def _call_minimax(text: str, instruction: str, max_tokens: int = 2048) -> str:
         {
             "model": MINIMAX_MODEL,
             "max_tokens": max_tokens,
+            "temperature": temperature,
             "system": "你是一个直播内容总结助手。用中文回复，简洁、有条理。",
             "messages": [
                 {"role": "user",
@@ -173,7 +174,7 @@ def _call_minimax(text: str, instruction: str, max_tokens: int = 2048) -> str:
 #   OpenAI 兼容接口（DeepSeek / 自定义）
 # ============================================
 
-def _call_openai(text: str, instruction: str, max_tokens: int = 2048) -> str:
+def _call_openai(text: str, instruction: str, max_tokens: int = 2048, temperature: float = 0.7) -> str:
     from config import (
         SUMMARIZER_API,
         DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
@@ -196,6 +197,7 @@ def _call_openai(text: str, instruction: str, max_tokens: int = 2048) -> str:
         {
             "model": model,
             "max_tokens": max_tokens,
+            "temperature": temperature,
             "messages": [
                 {"role": "system",
                  "content": "你是一个直播/视频内容总结助手。用中文回复，简洁、有条理。"},
@@ -308,13 +310,15 @@ def _merge_chunk_summaries(chunk_summaries: list, scene: str, max_tokens: int) -
     instruction = (
         "以下是同一场直播按时间段分段生成的总结要点。"
         "请将它们合并、去重、按时间逻辑重排，生成一份完整连贯、"
-        "覆盖全部独立信息点的直播简报。不要遗漏任何段落独有的话题或事件。\n\n"
+        "覆盖全部独立信息点的直播简报。\n"
+        "输出前请逐条核对下面每个【第 N 段】的要点，确保每一条都已在简报中体现；"
+        "不允许遗漏任何段落独有的话题或事件，宁可在简报中多列一条，也不要漏掉。\n\n"
         f"{blocks}"
     )
     from config import SUMMARIZER_API
     if SUMMARIZER_API == "minimax":
-        return _call_minimax(blocks, instruction, max_tokens)
-    return _call_openai(blocks, instruction, max_tokens)
+        return _call_minimax(blocks, instruction, max_tokens, temperature=0.2)
+    return _call_openai(blocks, instruction, max_tokens, temperature=0.2)
 
 
 def _summarize_long(text: str, scene: str, max_tokens: int) -> str:
