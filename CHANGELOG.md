@@ -25,6 +25,26 @@
 
 ---
 
+## v1.8.0 — 2026-08-09
+
+### ✨ New Features
+
+- **长文本分段总结** — `summarize_with_api` 对超长转写自动分段总结再合并：
+  - **分段**：每段 ≤ `SUMMARY_CHUNK_TOKENS`（默认 15000，中文约 1 字符 ≈ 1 token），按行切分不切断句。
+  - **上下文衔接**（`SUMMARY_CONTEXT_MODE`，默认 `both`）：
+    - `overlap`：每段开头内嵌上一段尾部 `SUMMARY_OVERLAP_TOKENS`（默认 1500）字符的原文，解决口语指代（“那个板子”“刚才说的”）
+    - `summary`：每段携带上一段 LLM 生成的摘要，保持话题级连贯
+  - **两级合并**：逐段总结（Map）→ 全部要点合并去重生成最终完整简报（Reduce），不遗漏任何段落独有信息。
+  - 短文本（≤阈值）走原单次调用路径，零回归。
+- **总结输出上限提升** — 段总结与最终合并 `max_tokens` 从 2048 提升至 `SUMMARY_MAX_OUTPUT_TOKENS`（默认 4096），防详细总结被截断。
+
+### 🔧 Internal
+
+- `config.py`：新增 `SUMMARY_CHUNK_TOKENS` / `SUMMARY_OVERLAP_TOKENS` / `SUMMARY_CONTEXT_MODE` / `SUMMARY_MAX_OUTPUT_TOKENS`（可经 config.local.json 的 `summary.*` 覆盖）。
+- `summarizer.py`：新增 `_split_chunks_with_overlap` / `_summarize_chunk_with_context` / `_merge_chunk_summaries` / `_summarize_long`。
+
+---
+
 ## v1.7.1 — 2026-08-09
 
 ### 🐛 Bug Fixes

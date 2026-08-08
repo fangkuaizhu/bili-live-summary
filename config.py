@@ -70,6 +70,17 @@ OPENAI_BASE_URL = _get("api.openai.base_url", "https://api.openai.com")
 OPENAI_MODEL = _get("api.openai.model", "gpt-4o-mini")
 
 
+# ========== 长文本分段总结 ==========
+# 转写文本超过该长度（字符，中文约 1 字符 ≈ 1 token）时，按段总结再合并
+SUMMARY_CHUNK_TOKENS = _get("summary.chunk_tokens", 15000)
+# 相邻段落之间的原文重叠长度（字符），用于上下文衔接
+SUMMARY_OVERLAP_TOKENS = _get("summary.overlap_tokens", 1500)
+# 段间衔接方式: "summary"=前段摘要(方案A) / "overlap"=前段尾部原文(方案B) / "both"=两者结合
+SUMMARY_CONTEXT_MODE = _get("summary.context_mode", "both")
+# 总结 API 输出 token 上限（段总结与最终合并共用）
+SUMMARY_MAX_OUTPUT_TOKENS = _get("summary.max_output_tokens", 4096)
+
+
 # ========== 场景预设 ==========
 SCENE_PROMPTS = {
     "lecture": {
