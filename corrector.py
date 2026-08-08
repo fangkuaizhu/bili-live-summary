@@ -12,7 +12,49 @@ from config import (
     MINIMAX_API_KEY, MINIMAX_MODEL,
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
     OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL,
+    get_scene_terms,
 )
+
+
+CORRECTION_PROMPT_TEMPLATE = """你是一个 Whisper 语音转写纠错助手。请对以下转写文本进行同音/近音错字的纠正。
+
+允许修改的项目（仅限上下文证据明确的错误，不确定时保留原文，宁缺毋滥）：
+1. 专有名词（人名、地名、机构名、品牌名）
+2. 医学术语、科技术语
+3. 产品名、型号名
+4. 专业缩写、英文术语被错误音译的情况
+5. 明显的同音错字：结合上下文判断，包括量词、动词、常用搭配中的同音字错误
+   示例：「优化了一楼方案」→「优化了一版方案」、「换紧焦虑」→「缓解焦虑」、「重疗风险」→「重疾风险」
+6. 领域术语优先：当转写中的词与【领域术语参考】中的专有名词同音或近音，
+   且上下文属于该领域的专业讨论（如游戏角色强度、技能、抽卡、皮肤）时，
+   必须改写为术语表中的正确名称，不要因“读着能通”而保留错误写法。
+   示例：「新手克制斗牛士」「新手怕拉点」→「心兽克制斗牛士」「心兽怕拉点」（心兽是新监管者，非“新手玩家”）；
+   「魚人真好耶」→「渔女真好耶」（第五人格监管者渔女）。
+{terms}
+
+严格禁止：
+- 改动原有句式结构
+- 删除或缩短任何内容
+- 润色文风、调整语序
+- 添加原文本中没有的信息
+- 修正语法错误（除非是同音错字导致的）
+
+输出要求：
+- 仅返回纠正后的完整文本
+- 不要添加任何说明、标记或注释
+- 文本结构、段落、标点保持与原文本完全一致"""
+
+
+def _correction_prompt(scene: str) -> str:
+    """构造纠错 prompt：注入场景领域术语表（角色名/术语，防止专有名词被误转写后保留）"""
+    terms = get_scene_terms(scene)
+    terms_block = (
+        "\n【领域术语参考】（转写可能将这些专有名词写成同音字；以下为正确写法，"
+        "涉及时应优先使用，不涉及的内容不要强行套用）：\n"
+        + terms
+        + "\n"
+    ) if terms else ""
+    return CORRECTION_PROMPT_TEMPLATE.replace("{terms}", terms_block)
 
 
 def _get_correction_api_key(platform: str) -> str:
@@ -71,7 +113,7 @@ def _split_text(text: str, max_chunk: int = 6000) -> list:
     return chunks
 
 
-def _call_minimax_correction(text: str) -> str:
+def _call_minimax_correction(text: str, scene: str = "general") -> str:
     """调用 MiniMax API 进行纠错（Anthropic 兼容接口）"""
     api_key = _get_correction_api_key("minimax")
     if not api_key:
@@ -88,7 +130,7 @@ def _call_minimax_correction(text: str) -> str:
             json={
                 "model": MINIMAX_MODEL,
                 "max_tokens": 8192,
-                "system": CORRECTION_PROMPT,
+                "system": _correction_prompt(scene),
                 "messages": [
                     {"role": "user", "content": text}
                 ],
@@ -110,7 +152,7 @@ def _call_minimax_correction(text: str) -> str:
         return text
 
 
-def _call_openai_compatible_correction(text: str) -> str:
+def _call_openai_compatible_correction(text: str, scene: str = "general") -> str:
     """调用 OpenAI 兼容接口（DeepSeek / OpenAI）进行纠错"""
     platform = SUMMARIZER_API
     api_key = _get_correction_api_key(platform)
@@ -136,7 +178,7 @@ def _call_openai_compatible_correction(text: str) -> str:
                 "model": model,
                 "max_tokens": 8192,
                 "messages": [
-                    {"role": "system", "content": CORRECTION_PROMPT},
+                    {"role": "system", "content": _correction_prompt(scene)},
                     {"role": "user", "content": text},
                 ],
                 "stream": False,
@@ -189,14 +231,14 @@ def correct_transcript(
         for i, chunk in enumerate(chunks):
             print(f"[纠错] 批次 {i + 1}/{len(chunks)} ({len(chunk)} 字符)")
             if SUMMARIZER_API == "minimax":
-                corrected = _call_minimax_correction(chunk)
+                corrected = _call_minimax_correction(chunk, scene)
             else:
-                corrected = _call_openai_compatible_correction(chunk)
+                corrected = _call_openai_compatible_correction(chunk, scene)
             corrected_chunks.append(corrected)
         return "\n".join(corrected_chunks)
 
     # 正常长度直接调用
     if SUMMARIZER_API == "minimax":
-        return _call_minimax_correction(text)
+        return _call_minimax_correction(text, scene)
     else:
-        return _call_openai_compatible_correction(text)
+        return _call_openai_compatible_correction(text, scene)

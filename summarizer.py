@@ -16,6 +16,7 @@ from typing import Optional
 
 from config import (
     get_scene_config,
+    get_scene_terms,
     OUTPUT_DIR,
     SUMMARY_CHUNK_TOKENS,
     SUMMARY_OVERLAP_TOKENS,
@@ -219,6 +220,20 @@ def _call_openai(text: str, instruction: str, max_tokens: int = 2048, temperatur
 #   统一入口
 # ============================================
 
+def _with_terms(instruction: str, scene: str) -> str:
+    """在总结指令前注入场景领域术语表（角色名/术语正确写法）"""
+    terms = get_scene_terms(scene)
+    if not terms:
+        return instruction
+    return (
+        "【领域术语参考】（以下角色/术语为正确写法。转写文本中若出现与这些术语"
+        "同音或近音的词，如「新手」实为监管者「心兽」、「魚人」实为监管者「渔女」，"
+        "总结时应使用正确名称，不要沿用转写中的错误写法）：\n"
+        f"{terms}\n\n"
+        f"{instruction}"
+    )
+
+
 def _split_chunks_with_overlap(
     text: str,
     chunk_chars: int = None,
@@ -276,7 +291,7 @@ def _summarize_chunk_with_context(
     是否启用由 SUMMARY_CONTEXT_MODE 控制。
     """
     scene_cfg = get_scene_config(scene)
-    instruction = scene_cfg["summary_instruction"]
+    instruction = _with_terms(scene_cfg["summary_instruction"], scene)
 
     ctx = ""
     if prev_summary and SUMMARY_CONTEXT_MODE in ("summary", "both"):
@@ -307,14 +322,15 @@ def _merge_chunk_summaries(chunk_summaries: list, scene: str, max_tokens: int) -
     blocks = "\n\n".join(
         f"【第 {i + 1} 段】\n{s}" for i, s in enumerate(chunk_summaries)
     )
-    instruction = (
+    instruction = _with_terms(
         "以下是同一场直播按时间段分段生成的总结要点。"
         "请将它们合并、去重、按时间逻辑重排，生成一份完整连贯、"
         "覆盖全部独立信息点的直播简报。\n"
         "输出前请逐条核对下面每个【第 N 段】的要点，确保每一条都已在简报中体现；"
-        "不允许遗漏任何段落独有的话题或事件，宁可在简报中多列一条，也不要漏掉。\n\n"
-        f"{blocks}"
+        "不允许遗漏任何段落独有的话题或事件，宁可在简报中多列一条，也不要漏掉。",
+        scene,
     )
+    instruction = instruction + f"\n\n{blocks}"
     from config import SUMMARIZER_API
     if SUMMARIZER_API == "minimax":
         return _call_minimax(blocks, instruction, max_tokens, temperature=0.2)
@@ -355,7 +371,7 @@ def summarize_with_api(text: str, scene: str = "general", max_tokens: int = None
         max_tokens = SUMMARY_MAX_OUTPUT_TOKENS
 
     scene_cfg = get_scene_config(scene)
-    instruction = scene_cfg["summary_instruction"]
+    instruction = _with_terms(scene_cfg["summary_instruction"], scene)
 
     # 长文本：分段总结 + 上下文衔接 + 最终合并
     if len(text) > SUMMARY_CHUNK_TOKENS:
